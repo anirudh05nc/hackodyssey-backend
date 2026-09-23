@@ -2,7 +2,7 @@ import os
 import csv
 import time
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,16 +17,26 @@ app = FastAPI(
 
 origins = [
     "https://hackodyssey.gfgkare.in",
-    "http://localhost:5173"
+    "http://hackodyssey.gfgkare.in",
+    "https://hack26.anc-anirudh.online",
+    "http://hack26.anc-anirudh.online",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
 ]
 
 # Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Point boto3 to your local folder
@@ -774,12 +784,51 @@ PROBLEMS_CSV_S3_KEY = "problemstatements/problems.csv"
 
 
 @app.post("/api/problems/upload-direct")
-def upload_problems_csv_direct(req: ProblemCsvDirectUploadRequest):
+async def upload_problems_csv_direct(request: Request):
     """
     Direct server-side upload of Problem Statements CSV to S3.
     Bypasses browser-to-S3 CORS and signature restrictions.
+    Accepts JSON {"csv_content": "..."}, multipart FormData with file, or raw text.
     """
-    if not req.csv_content or not req.csv_content.strip():
+    csv_content = ""
+    content_type = request.headers.get("content-type", "")
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            csv_content = body.get("csv_content", "")
+        except Exception:
+            pass
+    elif "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            file_item = form.get("file")
+            if file_item and hasattr(file_item, "read"):
+                csv_bytes = await file_item.read()
+                csv_content = csv_bytes.decode('utf-8', errors='replace')
+            elif file_item and isinstance(file_item, str):
+                csv_content = file_item
+            else:
+                csv_content = str(form.get("csv_content", ""))
+        except Exception:
+            pass
+
+    if not csv_content:
+        # Fallback to reading raw body
+        try:
+            body_bytes = await request.body()
+            if body_bytes:
+                text = body_bytes.decode('utf-8', errors='replace')
+                if text.strip().startswith("{") and "csv_content" in text:
+                    import json
+                    parsed = json.loads(text)
+                    csv_content = parsed.get("csv_content", "")
+                else:
+                    csv_content = text
+        except Exception:
+            pass
+
+    if not csv_content or not csv_content.strip():
         raise HTTPException(status_code=400, detail="CSV content cannot be empty.")
 
     try:
@@ -787,7 +836,7 @@ def upload_problems_csv_direct(req: ProblemCsvDirectUploadRequest):
             s3_client.put_object(
                 Bucket=S3_BUCKET,
                 Key=PROBLEMS_CSV_S3_KEY,
-                Body=req.csv_content.encode('utf-8'),
+                Body=csv_content.encode('utf-8'),
                 ContentType='text/csv'
             )
         except ClientError as s3_err:
@@ -797,7 +846,7 @@ def upload_problems_csv_direct(req: ProblemCsvDirectUploadRequest):
                 s3_client.put_object(
                     Bucket=S3_BUCKET,
                     Key=PROBLEMS_CSV_S3_KEY,
-                    Body=req.csv_content.encode('utf-8'),
+                    Body=csv_content.encode('utf-8'),
                     ContentType='text/csv'
                 )
             else:
@@ -1204,6 +1253,154 @@ def import_data(req: ImportRequest):
         return {"message": f"Successfully imported {imported_count} team profiles and their roster members."}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.post("/seed-csv-data")
+@app.post("/admin/seed-csv-data")
+async def seed_csv_data(request: Request):
+    """
+    Ingests and seeds parsed teams and participants CSV records into DynamoDB.
+    Handles varied CSV column names (TeamID / TeamId, Team Name / TeamName, etc.)
+    and preserves existing team evaluations, link submissions, and problem selections.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    raw_teams = body.get("teams", [])
+    raw_participants = body.get("participants", [])
+
+    if not raw_teams and not raw_participants:
+        raise HTTPException(status_code=400, detail="No teams or participants provided in payload.")
+
+    try:
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        settings_item = settings_res.get('Item', {})
+        if settings_item.get('DeleteProtectionActive', False):
+            raise HTTPException(
+                status_code=400,
+                detail="Action Denied: Delete Protection is currently active. Disable it to modify/overwrite team registers."
+            )
+
+        # 1. Group participants by Team ID
+        team_members_map = {}
+        for p in raw_participants:
+            t_id = str(p.get("TeamID") or p.get("TeamId") or p.get("team_id") or p.get("teamId") or "").strip()
+            if not t_id:
+                continue
+            if t_id not in team_members_map:
+                team_members_map[t_id] = []
+
+            team_members_map[t_id].append({
+                "name": str(p.get("Name") or p.get("name") or "").strip(),
+                "regNo": str(p.get("RegNo") or p.get("regNo") or p.get("reg_no") or "").strip(),
+                "email": str(p.get("Email") or p.get("email") or "").strip(),
+                "phone": str(p.get("Phone") or p.get("phone") or "").strip(),
+                "gender": str(p.get("Gender") or p.get("gender") or "").strip(),
+                "branch": str(p.get("Branch") or p.get("branch") or "").strip(),
+                "year": str(p.get("Year") or p.get("year") or "").strip(),
+                "accommodation": str(p.get("Accommodation") or p.get("accommodation") or "").strip(),
+                "hostelName": str(p.get("HostelName") or p.get("hostelName") or p.get("Hostel") or "").strip(),
+                "roomNo": str(p.get("RoomNo") or p.get("roomNo") or p.get("Room") or "").strip(),
+                "wardenName": str(p.get("WardenName") or p.get("wardenName") or "").strip(),
+                "wardenPhone": str(p.get("WardenPhone") or p.get("wardenPhone") or "").strip(),
+            })
+
+        # 2. Build teams dict
+        teams_to_seed = {}
+
+        # Add explicit teams if provided
+        for team in raw_teams:
+            t_id = str(team.get("TeamID") or team.get("TeamId") or team.get("team_id") or team.get("teamId") or "").strip()
+            if not t_id:
+                continue
+            t_name = str(team.get("Team Name") or team.get("TeamName") or team.get("team_name") or f"Team {t_id}").strip()
+            password = str(team.get("Password") or team.get("password") or "hackodyssey2026").strip()
+            leader_name = str(team.get("Leader Name") or team.get("LeaderName") or team.get("leader_name") or "").strip()
+            leader_email = str(team.get("Leader Email") or team.get("LeaderEmail") or team.get("leader_email") or "").strip()
+            leader_phone = str(team.get("Leader Phone") or team.get("LeaderPhone") or team.get("leader_phone") or "").strip()
+            leader_reg_no = str(team.get("Leader RegNo") or team.get("LeaderRegNo") or team.get("leader_reg_no") or "").strip()
+            status = str(team.get("Status") or team.get("TransactionStatus") or "SUCCESS").strip()
+            submitted_at = str(team.get("Submitted At") or team.get("SubmittedAt") or team.get("SubmittedTimestamp") or "").strip()
+            transaction_id = str(team.get("Transaction ID") or team.get("TransactionID") or "").strip()
+
+            teams_to_seed[t_id] = {
+                'TeamID': t_id,
+                'Team Name': t_name,
+                'Password': password,
+                'Leader Name': leader_name,
+                'Leader Email': leader_email,
+                'Leader Phone': leader_phone,
+                'Leader RegNo': leader_reg_no,
+                'Transaction ID': transaction_id,
+                'Status': status,
+                'Submitted At': submitted_at,
+                'Members': team_members_map.get(t_id, [])
+            }
+
+        # If participants exist for teams not explicitly in raw_teams, synthesize team records
+        for t_id, members in team_members_map.items():
+            if t_id not in teams_to_seed:
+                matching_p = next((p for p in raw_participants if str(p.get("TeamID") or p.get("TeamId") or p.get("team_id") or "").strip() == t_id), {})
+                t_name = str(matching_p.get("TeamName") or matching_p.get("Team Name") or f"Team {t_id}").strip()
+                pwd = str(matching_p.get("Password") or matching_p.get("password") or "hackodyssey2026").strip()
+                status = str(matching_p.get("TransactionStatus") or matching_p.get("Status") or "SUCCESS").strip()
+                sub_at = str(matching_p.get("SubmittedTimestamp") or matching_p.get("SubmittedAt") or "").strip()
+                selected_prob = str(matching_p.get("SelectedProblem") or "").strip()
+
+                first_m = members[0] if members else {}
+                team_record = {
+                    'TeamID': t_id,
+                    'Team Name': t_name,
+                    'Password': pwd,
+                    'Leader Name': first_m.get('name', ''),
+                    'Leader Email': first_m.get('email', ''),
+                    'Leader Phone': first_m.get('phone', ''),
+                    'Leader RegNo': first_m.get('regNo', ''),
+                    'Transaction ID': '',
+                    'Status': status,
+                    'Submitted At': sub_at,
+                    'Members': members
+                }
+                if selected_prob:
+                    team_record['SelectedProblem'] = selected_prob
+                teams_to_seed[t_id] = team_record
+
+        # 3. For each team, resolve leader info from members if blank, preserve existing items, and save
+        imported_count = 0
+        for t_id, item_payload in teams_to_seed.items():
+            members = item_payload.get('Members', [])
+            if not item_payload['Leader Name'] and members:
+                item_payload['Leader Name'] = members[0].get('name', '')
+                item_payload['Leader Email'] = members[0].get('email', '')
+                item_payload['Leader Phone'] = members[0].get('phone', '')
+                item_payload['Leader RegNo'] = members[0].get('regNo', '')
+
+            try:
+                existing_res = table.get_item(Key={'TeamID': t_id})
+                existing_item = existing_res.get('Item')
+                if existing_item:
+                    for field in ['SelectedProblem', 'DeployedLink', 'Certificates', 'EvaluationStatus', 'ReviewFeedback', 'EvaluationScore']:
+                        if field in existing_item and field not in item_payload:
+                            item_payload[field] = existing_item[field]
+            except Exception:
+                pass
+
+            table.put_item(Item=item_payload)
+            imported_count += 1
+
+        return {
+            "message": f"Successfully seeded {imported_count} team profiles and {len(raw_participants)} participant records into DynamoDB.",
+            "seeded_teams": imported_count,
+            "seeded_participants": len(raw_participants)
+        }
+    except HTTPException:
+        raise
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response.get('Error', {}).get('Message', str(e)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/admin/delete-all-teams")
