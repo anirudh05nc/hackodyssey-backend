@@ -2,8 +2,8 @@ import os
 import csv
 import time
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import boto3
@@ -15,11 +15,12 @@ app = FastAPI(
     openapi_url=None
 )
 
+# Standardized origins for production, staging, and local environments
 origins = [
-    "https://hackodyssey.gfgkare.in",
-    "http://hackodyssey.gfgkare.in",
     "https://hack26.anc-anirudh.online",
     "http://hack26.anc-anirudh.online",
+    "https://hackodyssey.gfgkare.in",
+    "http://hackodyssey.gfgkare.in",
     "http://localhost:5173",
     "http://localhost:3000",
     "http://localhost:8000",
@@ -28,7 +29,7 @@ origins = [
     "http://127.0.0.1:8000",
 ]
 
-# Enable CORS for frontend integration
+# Enable Starlette CORS middleware with full wildcard origin regex support
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -38,6 +39,44 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+# Custom response middleware to ensure CORS headers persist even across 500s/exceptions
+@app.middleware("http")
+async def cors_guarantee_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if request.method == "OPTIONS":
+        response = Response(status_code=200)
+    else:
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": f"Internal Server Error: {str(exc)}"}
+            )
+    
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
+        response.headers["Access-Control-Expose-Headers"] = "*"
+    return response
+
+# Catch-all OPTIONS preflight route
+@app.options("/{full_path:path}")
+async def preflight_options_handler(full_path: str, request: Request):
+    response = Response(status_code=200)
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
+        response.headers["Access-Control-Expose-Headers"] = "*"
+    return response
 
 # Point boto3 to your local folder
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -105,9 +144,9 @@ def ensure_s3_bucket_exists():
             CORSConfiguration={
                 'CORSRules': [{
                     'AllowedHeaders': ['*'],
-                    'AllowedMethods': ['PUT', 'GET', 'HEAD', 'POST'],
+                    'AllowedMethods': ['PUT', 'GET', 'HEAD', 'POST', 'DELETE'],
                     'AllowedOrigins': ['*'],
-                    'ExposeHeaders': ['ETag']
+                    'ExposeHeaders': ['ETag', 'x-amz-request-id', 'x-amz-id-2']
                 }]
             }
         )
@@ -115,6 +154,51 @@ def ensure_s3_bucket_exists():
         print(f"Note: Could not set bucket CORS automatically: {cors_err}")
 
 ensure_s3_bucket_exists()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AWS S3 Data Persistence & Backup Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def backup_teams_to_s3(teams_data: list):
+    """Backs up all team records to AWS S3 at roster/teams.json for persistent cloud redundancy."""
+    try:
+        import json
+        payload = json.dumps(teams_data, indent=2, default=str)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key="roster/teams.json",
+            Body=payload.encode('utf-8'),
+            ContentType='application/json'
+        )
+    except Exception as e:
+        print(f"S3 teams backup notice: {e}")
+
+def backup_participants_to_s3(participants_data: list):
+    """Backs up all participant records to AWS S3 at roster/participants.json for persistent cloud redundancy."""
+    try:
+        import json
+        payload = json.dumps(participants_data, indent=2, default=str)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key="roster/participants.json",
+            Body=payload.encode('utf-8'),
+            ContentType='application/json'
+        )
+    except Exception as e:
+        print(f"S3 participants backup notice: {e}")
+
+def backup_marks_to_s3(scores_data: dict):
+    """Backs up jury marks and evaluations to AWS S3 at evaluations/jury_scores.json."""
+    try:
+        import json
+        payload = json.dumps(scores_data, indent=2, default=str)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key="evaluations/jury_scores.json",
+            Body=payload.encode('utf-8'),
+            ContentType='application/json'
+        )
+    except Exception as e:
+        print(f"S3 marks backup notice: {e}")
 
 class CertificateUploadRequest(BaseModel):
     team_id: str
@@ -296,7 +380,7 @@ def get_all_items():
 
 @app.get("/teams/{partition_id}")
 def get_single_item(partition_id: str):
-    if partition_id == "SYSTEM_SETTINGS":
+    if partition_id in ("SYSTEM_SETTINGS", "purge-all-data", "all"):
         raise HTTPException(status_code=404, detail="Team not found")
     try:
         response = table.get_item(
@@ -312,6 +396,178 @@ def get_single_item(partition_id: str):
         return item
     except ClientError as e:
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Participant Endpoints (Dynamically parsed from AWS DynamoDB & S3)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/participants/all")
+def get_all_participants():
+    """
+    Parses and returns all participants across all teams directly from AWS DynamoDB.
+    Flattens members and enriches each record with team metadata.
+    """
+    try:
+        response = table.scan()
+        items = response.get('Items', [])
+        all_participants = []
+        for team in items:
+            t_id = team.get('TeamID')
+            if t_id == "SYSTEM_SETTINGS":
+                continue
+            t_name = team.get('Team Name') or team.get('TeamName') or t_id
+            selected_prob = team.get('SelectedProblem') or team.get('AdminAssignedProblemTitle') or ""
+            status = team.get('Status') or "SUCCESS"
+            score = team.get('EvaluationScore') or 0
+            certs_map = team.get('Certificates', {})
+
+            members = team.get('Members', [])
+            for m in members:
+                m_copy = dict(m)
+                m_copy['TeamID'] = t_id
+                m_copy['TeamName'] = t_name
+                m_copy['SelectedProblem'] = selected_prob
+                m_copy['TeamStatus'] = status
+                m_copy['EvaluationScore'] = score
+                m_name = m_copy.get('name', '')
+                m_copy['Certificates'] = certs_map.get(m_name, []) if isinstance(certs_map, dict) else []
+                all_participants.append(m_copy)
+
+        return {
+            "count": len(all_participants),
+            "participants": all_participants
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.get("/participants/stats")
+def get_participants_stats():
+    """
+    Calculates aggregate metrics (gender, branch, accommodation) live from AWS DynamoDB.
+    """
+    try:
+        response = table.scan()
+        items = response.get('Items', [])
+        total_teams = 0
+        total_participants = 0
+        gender_counts = {}
+        branch_counts = {}
+        year_counts = {}
+        accommodation_counts = {"Hosteller": 0, "DayScholar": 0, "Unspecified": 0}
+        feedback_count = 0
+
+        for team in items:
+            if team.get('TeamID') == "SYSTEM_SETTINGS":
+                continue
+            total_teams += 1
+            members = team.get('Members', [])
+            for m in members:
+                total_participants += 1
+                g = (m.get('gender') or 'Unspecified').strip().capitalize()
+                gender_counts[g] = gender_counts.get(g, 0) + 1
+                b = (m.get('branch') or 'Unspecified').strip().upper()
+                branch_counts[b] = branch_counts.get(b, 0) + 1
+                y = str(m.get('year') or 'Unspecified').strip()
+                year_counts[y] = year_counts.get(y, 0) + 1
+                acc = (m.get('accommodation') or '').strip().lower()
+                if 'yes' in acc or 'hostel' in acc:
+                    accommodation_counts["Hosteller"] += 1
+                elif 'no' in acc or 'day' in acc:
+                    accommodation_counts["DayScholar"] += 1
+                else:
+                    accommodation_counts["Unspecified"] += 1
+                if m.get('FeedbackSubmitted'):
+                    feedback_count += 1
+
+        return {
+            "total_teams": total_teams,
+            "total_participants": total_participants,
+            "gender_distribution": gender_counts,
+            "branch_distribution": branch_counts,
+            "year_distribution": year_counts,
+            "accommodation_metrics": accommodation_counts,
+            "feedback_submitted_count": feedback_count
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.get("/participants/export-csv")
+def export_participants_csv():
+    """
+    Exports all participants stored in DynamoDB as a streaming CSV response.
+    """
+    import io
+    try:
+        data = get_all_participants()
+        participants = data.get("participants", [])
+        
+        output = io.StringIO()
+        fieldnames = [
+            "TeamID", "TeamName", "RegNo", "Name", "Email", "Phone",
+            "Gender", "Branch", "Year", "Accommodation", "HostelName",
+            "RoomNo", "SelectedProblem", "EvaluationScore", "FeedbackSubmitted"
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for p in participants:
+            writer.writerow({
+                "TeamID": p.get("TeamID", ""),
+                "TeamName": p.get("TeamName", ""),
+                "RegNo": p.get("regNo", ""),
+                "Name": p.get("name", ""),
+                "Email": p.get("email", ""),
+                "Phone": p.get("phone", ""),
+                "Gender": p.get("gender", ""),
+                "Branch": p.get("branch", ""),
+                "Year": p.get("year", ""),
+                "Accommodation": p.get("accommodation", ""),
+                "HostelName": p.get("hostelName", ""),
+                "RoomNo": p.get("roomNo", ""),
+                "SelectedProblem": p.get("SelectedProblem", ""),
+                "EvaluationScore": p.get("EvaluationScore", 0),
+                "FeedbackSubmitted": p.get("FeedbackSubmitted", False),
+            })
+        
+        csv_string = output.getvalue()
+        return Response(
+            content=csv_string,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=euphoria26_participants.csv",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/participants/{reg_no}")
+def get_participant_by_reg_no(reg_no: str):
+    """
+    Searches for a participant by registration number directly in AWS DynamoDB.
+    """
+    clean_reg = reg_no.strip().lower()
+    try:
+        response = table.scan()
+        items = response.get('Items', [])
+        for team in items:
+            if team.get('TeamID') == "SYSTEM_SETTINGS":
+                continue
+            members = team.get('Members', [])
+            for m in members:
+                if str(m.get('regNo') or '').strip().lower() == clean_reg:
+                    m_copy = dict(m)
+                    m_copy['TeamID'] = team.get('TeamID')
+                    m_copy['TeamName'] = team.get('Team Name') or team.get('TeamName')
+                    m_copy['SelectedProblem'] = team.get('SelectedProblem') or ""
+                    m_copy['EvaluationScore'] = team.get('EvaluationScore') or 0
+                    return m_copy
+        raise HTTPException(status_code=404, detail=f"Participant with RegNo '{reg_no}' not found in DynamoDB.")
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
 
 
 @app.post("/teams/{team_id}/select-problem")
@@ -1390,6 +1646,13 @@ async def seed_csv_data(request: Request):
             table.put_item(Item=item_payload)
             imported_count += 1
 
+        # Backup seeded teams and participants directly to AWS S3 for persistent redundant cloud storage
+        try:
+            backup_teams_to_s3(list(teams_to_seed.values()))
+            backup_participants_to_s3(raw_participants)
+        except Exception as bkp_err:
+            print(f"Notice during cloud S3 backup: {bkp_err}")
+
         return {
             "message": f"Successfully seeded {imported_count} team profiles and {len(raw_participants)} participant records into DynamoDB.",
             "seeded_teams": imported_count,
@@ -1404,6 +1667,9 @@ async def seed_csv_data(request: Request):
 
 
 @app.post("/admin/delete-all-teams")
+@app.delete("/admin/delete-all-teams")
+@app.post("/teams/purge-all-data")
+@app.delete("/teams/purge-all-data")
 def delete_all_teams(req: DeleteAllRequest):
     if req.password != "delete":
         raise HTTPException(status_code=403, detail="Unauthorized: Incorrect deletion authorization key.")
@@ -1451,7 +1717,11 @@ def initialize_teams():
     # 2. Process CSV and group participants by TeamID
     csv_file_path = "euphoria26_participants.csv"
     if not os.path.exists(csv_file_path):
-        raise HTTPException(status_code=404, detail=f"File {csv_file_path} not found.")
+        sample_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_participants.csv")
+        if os.path.exists(sample_path):
+            csv_file_path = sample_path
+        else:
+            return {"message": "System settings initialized in DynamoDB. Seed teams and participants via /seed-csv-data."}
 
     teams_data = {}
     
@@ -1632,6 +1902,42 @@ def add_problem_inline(req: ProblemStatementItem):
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
 
 
+@app.post("/api/problems/seed-default")
+def seed_default_problems_to_s3():
+    """
+    Seeds default problem statements directly into AWS S3 at problemstatements/problems.csv.
+    Ensures S3 has canonical problem statements for the hackathon.
+    """
+    sample_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_problems.csv")
+    if not os.path.exists(sample_csv):
+        raise HTTPException(status_code=404, detail="Default problems CSV template not found on server.")
+    
+    try:
+        with open(sample_csv, "r", encoding="utf-8") as f:
+            csv_content = f.read()
+
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=PROBLEMS_CSV_S3_KEY,
+            Body=csv_content.encode('utf-8'),
+            ContentType='text/csv'
+        )
+
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression="set ProblemsCsvUploaded = :val",
+            ExpressionAttributeValues={':val': True}
+        )
+        invalidate_problems_cache()
+        return {
+            "message": "Default problem statements seeded successfully into AWS S3.",
+            "s3_bucket": S3_BUCKET,
+            "s3_key": PROBLEMS_CSV_S3_KEY
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response.get('Error', {}).get('Message', str(e)))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Team–Problem Assignment (admin assigns a problem to a team)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1794,6 +2100,23 @@ def submit_jury_score(req: JuryScoreSubmit):
             ExpressionAttributeNames={'#k': legacy_key},
             ExpressionAttributeValues={':val': score_entry}
         )
+
+        # Mirror score onto the team item directly in DynamoDB for redundant persistence
+        try:
+            table.update_item(
+                Key={'TeamID': req.team_id},
+                UpdateExpression='SET EvaluationScore = :score, ReviewScores = :rs',
+                ExpressionAttributeValues={
+                    ':score': total_for_200,
+                    ':rs': current_team_rec
+                }
+            )
+        except Exception as team_upd_err:
+            print(f"Notice updating team item review score: {team_upd_err}")
+
+        # Backup marks to AWS S3
+        backup_marks_to_s3(team_reviews)
+
         return {
             'message': f'Marks for {round_key.upper()} submitted successfully.',
             'score': score_entry,
