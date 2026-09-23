@@ -16,7 +16,8 @@ app = FastAPI(
 )
 
 origins = [
-    "https://outbreak.gfgkare.in",
+    "https://hackodyssey.gfgkare.in",
+    "http://localhost:5173"
 ]
 
 # Enable CORS for frontend integration
@@ -38,8 +39,30 @@ session = boto3.Session()
 
 dynamodb = boto3.resource('dynamodb', region_name='ap-south-2') # Change to your region
 
-TABLE_NAME = "outbreak26_teams"
+TABLE_NAME = os.environ.get("TABLE_NAME", "euphoria26_teams")
 table = dynamodb.Table(TABLE_NAME)
+
+def ensure_table_exists():
+    global table, TABLE_NAME
+    try:
+        table.load()
+    except ClientError as e:
+        err_code = e.response.get('Error', {}).get('Code')
+        if err_code == 'ResourceNotFoundException':
+            try:
+                print(f"Creating DynamoDB table: {TABLE_NAME}...")
+                table = dynamodb.create_table(
+                    TableName=TABLE_NAME,
+                    KeySchema=[{'AttributeName': 'TeamID', 'KeyType': 'HASH'}],
+                    AttributeDefinitions=[{'AttributeName': 'TeamID', 'AttributeType': 'S'}],
+                    BillingMode='PAY_PER_REQUEST'
+                )
+                table.wait_until_exists()
+                print(f"Successfully created table {TABLE_NAME}")
+            except Exception as create_err:
+                print(f"Failed to auto-create table {TABLE_NAME}: {create_err}")
+
+ensure_table_exists()
 
 from botocore.config import Config
 s3_client = boto3.client(
@@ -48,7 +71,40 @@ s3_client = boto3.client(
     endpoint_url='https://s3.ap-south-2.amazonaws.com',
     config=Config(signature_version='s3v4')
 )
-S3_BUCKET = os.environ.get("S3_BUCKET", "outbreak26-certificates")
+S3_BUCKET = os.environ.get("S3_BUCKET", "euphoria26-certificates")
+
+def ensure_s3_bucket_exists():
+    global s3_client, S3_BUCKET
+    try:
+        s3_client.head_bucket(Bucket=S3_BUCKET)
+    except ClientError as e:
+        err_code = e.response.get('Error', {}).get('Code')
+        if err_code in ('404', 'NoSuchBucket'):
+            try:
+                print(f"Creating S3 bucket: {S3_BUCKET} in ap-south-2...")
+                s3_client.create_bucket(
+                    Bucket=S3_BUCKET,
+                    CreateBucketConfiguration={'LocationConstraint': 'ap-south-2'}
+                )
+            except Exception as create_err:
+                print(f"Failed to auto-create S3 bucket {S3_BUCKET}: {create_err}")
+    # Always ensure CORS is configured on the bucket
+    try:
+        s3_client.put_bucket_cors(
+            Bucket=S3_BUCKET,
+            CORSConfiguration={
+                'CORSRules': [{
+                    'AllowedHeaders': ['*'],
+                    'AllowedMethods': ['PUT', 'GET', 'HEAD', 'POST'],
+                    'AllowedOrigins': ['*'],
+                    'ExposeHeaders': ['ETag']
+                }]
+            }
+        )
+    except Exception as cors_err:
+        print(f"Note: Could not set bucket CORS automatically: {cors_err}")
+
+ensure_s3_bucket_exists()
 
 class CertificateUploadRequest(BaseModel):
     team_id: str
@@ -132,13 +188,73 @@ class ImportRequest(BaseModel):
 class DeleteAllRequest(BaseModel):
     password: str
 
+# ─────────────────────────────────────────────────────────────────────────────
+# New models: Jury Portal, Problem Statements, Leaderboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+VALID_SDG_IDS = {'SDG2', 'SDG3', 'SDG4', 'SDG6', 'SDG11', 'SDG13', 'HARDWARE'}
+
+SDG_CATEGORY_LABELS = {
+    'SDG2':     'Zero Hunger & Sustainable Agriculture',
+    'SDG3':     'Good Health & Well-Being Innovation',
+    'SDG4':     'Quality Education & Lifelong Learning',
+    'SDG6':     'Clean Water & Sanitation',
+    'SDG11':    'Sustainable Cities & Communities',
+    'SDG13':    'Climate Action & Environmental Monitoring',
+    'HARDWARE': 'Hardware',
+}
+
+JURY_CREDENTIALS = {
+    'jury1': 'hack26jury',
+    'jury2': 'hack26jury',
+    'jury3': 'hack26jury',
+}
+
+class ProblemStatementItem(BaseModel):
+    problem_id: str
+    sdg_id: str
+    title: str
+    description: str = ""
+    requirements: str = ""
+    expectations: str = ""
+
+class AssignProblemRequest(BaseModel):
+    problem_id: Optional[str] = None   # None = unassign
+    problem_title: Optional[str] = None
+    sdg_id: Optional[str] = None
+
+class JuryLoginRequest(BaseModel):
+    username: str
+    password: str
+
+class JuryScoreSubmit(BaseModel):
+    juror_id: str
+    team_id: str
+    review_round: Optional[str] = "review1"
+    innovation: int     # 0-25
+    execution: int      # 0-25
+    impact: int         # 0-25
+    presentation: int   # 0-25
+
+class ToggleLeaderboardRequest(BaseModel):
+    visible: bool
+
+class SetThresholdRequest(BaseModel):
+    threshold: int
+    published: bool = True
+    visible: bool = True
+
+class ToggleThresholdRequest(BaseModel):
+    visible: bool
+
+
 @app.api_route("/", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 def read_root():
     return HTMLResponse(content="""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Outbreak 26 API</title>
+        <title>Euphoria 26 API</title>
         <meta charset="utf-8">  
         <style>
             body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f0f2f5; margin: 0; }
@@ -149,7 +265,7 @@ def read_root():
     </head>
     <body>
         <div class="container">
-            <h1>Outbreak 26</h1>
+            <h1>Euphoria 26</h1>
             <p>API Server is active and running successfully.</p>
         </div>
     </body>
@@ -286,6 +402,10 @@ def get_settings():
                 'DeleteProtectionActive': False,
                 'ProblemsCsvUploaded': False,
                 'FeedbackEnabled': False,
+                'LeaderboardVisible': False,
+                'ThresholdValue': 0,
+                'ThresholdPublished': False,
+                'ThresholdVisible': False,
                 'CurrentPhaseIndex': 0,
                 'Announcements': []
             }
@@ -298,6 +418,10 @@ def get_settings():
                 'DeleteProtectionActive': False,
                 'ProblemsCsvUploaded': False,
                 'FeedbackEnabled': False,
+                'LeaderboardVisible': False,
+                'ThresholdValue': 0,
+                'ThresholdPublished': False,
+                'ThresholdVisible': False,
                 'CurrentPhaseIndex': 0,
                 'Announcements': [],
                 'ServerTime': int(_time.time())
@@ -310,6 +434,10 @@ def get_settings():
             'DeleteProtectionActive': item.get('DeleteProtectionActive', False),
             'ProblemsCsvUploaded': item.get('ProblemsCsvUploaded', False),
             'FeedbackEnabled': item.get('FeedbackEnabled', False),
+            'LeaderboardVisible': bool(item.get('LeaderboardVisible', False)),
+            'ThresholdValue': int(item.get('ThresholdValue', 0)),
+            'ThresholdPublished': bool(item.get('ThresholdPublished', False)),
+            'ThresholdVisible': bool(item.get('ThresholdVisible', False)),
             'CurrentPhaseIndex': int(item.get('CurrentPhaseIndex', 0)),
             'Announcements': item.get('Announcements', []),
             'ServerTime': int(_time.time())
@@ -651,28 +779,47 @@ def upload_problems_csv_direct(req: ProblemCsvDirectUploadRequest):
     Direct server-side upload of Problem Statements CSV to S3.
     Bypasses browser-to-S3 CORS and signature restrictions.
     """
-    try:
-        if not req.csv_content or not req.csv_content.strip():
-            raise HTTPException(status_code=400, detail="CSV content cannot be empty.")
+    if not req.csv_content or not req.csv_content.strip():
+        raise HTTPException(status_code=400, detail="CSV content cannot be empty.")
 
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=PROBLEMS_CSV_S3_KEY,
-            Body=req.csv_content.encode('utf-8'),
-            ContentType='text/csv'
-        )
+    try:
+        try:
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=PROBLEMS_CSV_S3_KEY,
+                Body=req.csv_content.encode('utf-8'),
+                ContentType='text/csv'
+            )
+        except ClientError as s3_err:
+            err_code = s3_err.response.get('Error', {}).get('Code')
+            if err_code in ('NoSuchBucket', '404'):
+                ensure_s3_bucket_exists()
+                s3_client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=PROBLEMS_CSV_S3_KEY,
+                    Body=req.csv_content.encode('utf-8'),
+                    ContentType='text/csv'
+                )
+            else:
+                raise s3_err
 
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
             UpdateExpression="set ProblemsCsvUploaded = :val",
             ExpressionAttributeValues={':val': True}
         )
+        invalidate_problems_cache()
         return {
             "message": "Problem statements CSV uploaded successfully.",
             "s3_key": PROBLEMS_CSV_S3_KEY
         }
     except ClientError as e:
-        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        print(f"Error in upload_problems_csv_direct: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"S3 Error: {error_msg}")
+    except Exception as e:
+        print(f"Unexpected error in upload_problems_csv_direct: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/problems/upload-csv")
@@ -767,6 +914,7 @@ def reset_problems_csv():
             UpdateExpression="set ProblemsCsvUploaded = :val, SelectionEnabled = :sel",
             ExpressionAttributeValues={':val': False, ':sel': False}
         )
+        invalidate_problems_cache()
         return {"message": "Problems CSV status reset. Admin must re-upload to enable selection."}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
@@ -1104,7 +1252,7 @@ def initialize_teams():
         raise HTTPException(status_code=500, detail=f"Failed to write system settings: {str(e)}")
 
     # 2. Process CSV and group participants by TeamID
-    csv_file_path = "outbreak26_participants.csv"
+    csv_file_path = "euphoria26_participants.csv"
     if not os.path.exists(csv_file_path):
         raise HTTPException(status_code=404, detail=f"File {csv_file_path} not found.")
 
@@ -1150,6 +1298,540 @@ def initialize_teams():
         raise HTTPException(status_code=500, detail=f"Failed to batch write teams: {str(e)}")
         
     return {"message": "Successfully initialized system settings and teams."}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Problem Statements: list (S3 CSV + inline adds)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_sdg_id(raw: str) -> str:
+    """Normalise sdg_id; unknown values fall back to HARDWARE."""
+    normalised = (raw or '').strip().upper()
+    return normalised if normalised in VALID_SDG_IDS else 'HARDWARE'
+
+
+def _parse_problems_csv(csv_text: str) -> list:
+    """Parse raw CSV text into a list of problem-statement dicts with category."""
+    import io
+    reader = csv.DictReader(io.StringIO(csv_text))
+    problems = []
+    for row in reader:
+        # Support flexible header capitalisation
+        sdg_raw = (
+            row.get('sdg_id') or row.get('SDG_ID') or row.get('SdgId') or
+            row.get('sdg') or row.get('SDG') or ''
+        ).strip()
+        sdg_id = _resolve_sdg_id(sdg_raw)
+        problems.append({
+            'problem_id':   (row.get('problem_id') or row.get('ProblemID') or row.get('id') or '').strip(),
+            'sdg_id':       sdg_id,
+            'category':     SDG_CATEGORY_LABELS.get(sdg_id, 'Hardware'),
+            'title':        (row.get('title') or row.get('Title') or '').strip(),
+            'description':  (row.get('description') or row.get('Description') or '').strip(),
+            'requirements': (row.get('requirements') or row.get('Requirements') or '').strip(),
+            'expectations': (row.get('expectations') or row.get('Expectations') or '').strip(),
+        })
+    return [p for p in problems if p['problem_id'] or p['title']]
+
+
+# ── Problems In-Memory Cache (60s TTL) ──────────────────────────────────────
+_PROBLEMS_CACHE = {
+    "data": None,
+    "timestamp": 0.0
+}
+_PROBLEMS_CACHE_TTL = 60.0  # 60 seconds (1 minute cache)
+
+def invalidate_problems_cache():
+    global _PROBLEMS_CACHE
+    _PROBLEMS_CACHE["data"] = None
+    _PROBLEMS_CACHE["timestamp"] = 0.0
+
+
+@app.get("/api/problems/list")
+def list_problems():
+    """
+    Returns merged problem statements:
+    1. Problems from S3 CSV (canonical source)
+    2. Inline-added problems stored in SYSTEM_SETTINGS.ProblemsData
+    Categorised by sdg_id at response time.
+    Cached for 60 seconds to provide instant (<1ms) response times.
+    """
+    global _PROBLEMS_CACHE
+    now = time.time()
+    if _PROBLEMS_CACHE["data"] is not None and (now - _PROBLEMS_CACHE["timestamp"] < _PROBLEMS_CACHE_TTL):
+        return _PROBLEMS_CACHE["data"]
+
+    problems = []
+
+    # 1. From S3 CSV
+    try:
+        resp = s3_client.get_object(Bucket=S3_BUCKET, Key=PROBLEMS_CSV_S3_KEY)
+        csv_text = resp['Body'].read().decode('utf-8')
+        problems.extend(_parse_problems_csv(csv_text))
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') != 'NoSuchKey':
+            raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+    # 2. From inline adds stored in DynamoDB SYSTEM_SETTINGS
+    try:
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        inline = settings_res.get('Item', {}).get('ProblemsData', [])
+        # De-duplicate by problem_id vs CSV
+        csv_ids = {p['problem_id'] for p in problems}
+        for p in inline:
+            if p.get('problem_id') not in csv_ids:
+                problems.append(p)
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+    result = {'count': len(problems), 'problems': problems}
+    _PROBLEMS_CACHE["data"] = result
+    _PROBLEMS_CACHE["timestamp"] = now
+    return result
+
+
+@app.post("/api/problems/add")
+def add_problem_inline(req: ProblemStatementItem):
+    """
+    Admin: Add a single problem statement inline (stored in SYSTEM_SETTINGS.ProblemsData).
+    Auto-assigns category based on sdg_id.
+    """
+    if not req.problem_id.strip():
+        raise HTTPException(status_code=400, detail="problem_id is required.")
+    if not req.title.strip():
+        raise HTTPException(status_code=400, detail="title is required.")
+
+    sdg_id = _resolve_sdg_id(req.sdg_id)
+    new_entry = {
+        'problem_id':   req.problem_id.strip(),
+        'sdg_id':       sdg_id,
+        'category':     SDG_CATEGORY_LABELS.get(sdg_id, 'Hardware'),
+        'title':        req.title.strip(),
+        'description':  req.description.strip(),
+        'requirements': req.requirements.strip(),
+        'expectations': req.expectations.strip(),
+    }
+
+    try:
+        # Initialise ProblemsData list if absent
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET ProblemsData = if_not_exists(ProblemsData, :empty)',
+            ExpressionAttributeValues={':empty': []}
+        )
+        # Fetch current list and append
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        current = list(settings_res.get('Item', {}).get('ProblemsData', []))
+        # Prevent duplicate problem_ids
+        current = [p for p in current if p.get('problem_id') != new_entry['problem_id']]
+        current.append(new_entry)
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET ProblemsData = :val',
+            ExpressionAttributeValues={':val': current}
+        )
+        invalidate_problems_cache()
+        return {'message': 'Problem statement added successfully.', 'problem': new_entry}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Team–Problem Assignment (admin assigns a problem to a team)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/teams/{team_id}/assign-problem")
+def assign_problem_to_team(team_id: str, req: AssignProblemRequest):
+    """
+    Admin: Assign or unassign a problem statement to a specific team.
+    Writes AdminAssignedProblem, AdminAssignedProblemTitle, AdminAssignedSdgId
+    to the team's DynamoDB record (separate from SelectedProblem).
+    Passing problem_id=null or omitting it = unassign.
+    """
+    if team_id == 'SYSTEM_SETTINGS':
+        raise HTTPException(status_code=400, detail='Invalid team ID.')
+    try:
+        res = table.get_item(Key={'TeamID': team_id})
+        if not res.get('Item'):
+            raise HTTPException(status_code=404, detail='Team not found.')
+
+        if req.problem_id:  # Assign
+            problem_title = (req.problem_title or '').strip()
+            if problem_title:
+                scan_resp = table.scan()
+                all_teams = scan_resp.get('Items', [])
+                count = sum(
+                    1 for t in all_teams 
+                    if t.get('TeamID') not in ('SYSTEM_SETTINGS', team_id) 
+                    and (t.get('SelectedProblem') == problem_title or t.get('AdminAssignedProblem') == req.problem_id.strip())
+                )
+                if count >= 3:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Problem statement has reached maximum capacity of 3 teams."
+                    )
+
+            sdg_id = _resolve_sdg_id(req.sdg_id or '')
+            table.update_item(
+                Key={'TeamID': team_id},
+                UpdateExpression=(
+                    'SET AdminAssignedProblem = :pid, '
+                    'AdminAssignedProblemTitle = :title, '
+                    'AdminAssignedSdgId = :sdg, '
+                    'SelectedProblem = :title'
+                ),
+                ExpressionAttributeValues={
+                    ':pid':   req.problem_id.strip(),
+                    ':title': problem_title,
+                    ':sdg':   sdg_id,
+                }
+            )
+            return {'message': 'Problem assigned successfully.', 'team_id': team_id, 'problem_id': req.problem_id}
+        else:  # Unassign
+            table.update_item(
+                Key={'TeamID': team_id},
+                UpdateExpression='REMOVE AdminAssignedProblem, AdminAssignedProblemTitle, AdminAssignedSdgId, SelectedProblem'
+            )
+            return {'message': 'Problem unassigned successfully.', 'team_id': team_id}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Jury Portal: login + scoring
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/jury/login")
+def jury_login(req: JuryLoginRequest):
+    """Validates jury credentials. Returns juror_id on success."""
+    expected = JURY_CREDENTIALS.get(req.username.strip().lower())
+    if not expected or req.password != expected:
+        raise HTTPException(status_code=401, detail='Invalid jury credentials.')
+    return {'ok': True, 'juror_id': req.username.strip().lower()}
+
+
+@app.post("/jury/score")
+def submit_jury_score(req: JuryScoreSubmit):
+    """
+    Submit or update a jury score for a team for Review 1 or Review 2.
+    Scores are stored in SYSTEM_SETTINGS.TeamReviewScores keyed by team_id,
+    ensuring that when one juror allocates marks, it syncs across all juror portals.
+    Total score for a team is computed out of 200 (Review 1 max 100 + Review 2 max 100).
+    """
+    if req.juror_id not in JURY_CREDENTIALS:
+        raise HTTPException(status_code=401, detail='Invalid juror ID.')
+
+    for field_name, val in [
+        ('innovation', req.innovation),
+        ('execution', req.execution),
+        ('impact', req.impact),
+        ('presentation', req.presentation),
+    ]:
+        if not (0 <= val <= 25):
+            raise HTTPException(status_code=400, detail=f'{field_name} must be between 0 and 25.')
+
+    round_key = req.review_round.strip().lower() if getattr(req, 'review_round', None) else "review1"
+    if round_key not in ("review1", "review2"):
+        round_key = "review1"
+
+    total = req.innovation + req.execution + req.impact + req.presentation
+    score_entry = {
+        'innovation':   req.innovation,
+        'execution':    req.execution,
+        'impact':       req.impact,
+        'presentation': req.presentation,
+        'total':        total,
+        'submitted_at': int(time.time()),
+        'juror_id':     req.juror_id,
+        'team_id':      req.team_id,
+        'review_round': round_key,
+    }
+
+    try:
+        # Fetch current SYSTEM_SETTINGS to retrieve TeamReviewScores
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        settings = settings_res.get('Item', {})
+        team_reviews = settings.get('TeamReviewScores', {})
+        
+        current_team_rec = team_reviews.get(req.team_id, {
+            'team_id': req.team_id,
+            'review1': None,
+            'review2': None,
+        })
+
+        # Save this review round
+        current_team_rec[round_key] = score_entry
+
+        r1_val = current_team_rec.get('review1', {}).get('total', 0) if current_team_rec.get('review1') else 0
+        r2_val = current_team_rec.get('review2', {}).get('total', 0) if current_team_rec.get('review2') else 0
+        total_for_200 = r1_val + r2_val
+
+        current_team_rec['total_score'] = total_for_200
+        current_team_rec['r1_total'] = r1_val
+        current_team_rec['r2_total'] = r2_val
+        current_team_rec['last_updated_at'] = int(time.time())
+        current_team_rec['last_juror_id'] = req.juror_id
+
+        # Update TeamReviewScores map in DynamoDB
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET TeamReviewScores = if_not_exists(TeamReviewScores, :empty)',
+            ExpressionAttributeValues={':empty': {}}
+        )
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET TeamReviewScores.#tid = :team_rec',
+            ExpressionAttributeNames={'#tid': req.team_id},
+            ExpressionAttributeValues={':team_rec': current_team_rec}
+        )
+
+        # Legacy backward-compatibility in JuryScores
+        legacy_key = f"{req.juror_id}_{req.team_id}_{round_key}"
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET JuryScores = if_not_exists(JuryScores, :empty)',
+            ExpressionAttributeValues={':empty': {}}
+        )
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET JuryScores.#k = :val',
+            ExpressionAttributeNames={'#k': legacy_key},
+            ExpressionAttributeValues={':val': score_entry}
+        )
+        return {
+            'message': f'Marks for {round_key.upper()} submitted successfully.',
+            'score': score_entry,
+            'team_scores': current_team_rec
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.get("/jury/scores")
+def get_jury_scores():
+    """Returns all team review scores synchronized across all jury portals."""
+    try:
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        settings = settings_res.get('Item', {})
+        team_reviews = settings.get('TeamReviewScores', {})
+        legacy_scores = settings.get('JuryScores', {})
+        return {
+            'scores': team_reviews,
+            'team_reviews': team_reviews,
+            'legacy_scores': legacy_scores
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Leaderboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/settings/toggle-leaderboard")
+def toggle_leaderboard(req: ToggleLeaderboardRequest):
+    """Admin: show or hide the participant-facing leaderboard."""
+    try:
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET LeaderboardVisible = :val',
+            ExpressionAttributeValues={':val': req.visible}
+        )
+        return {'message': 'Leaderboard visibility updated.', 'visible': req.visible}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.post("/settings/threshold")
+def set_qualification_threshold(req: SetThresholdRequest):
+    """Admin: set, update, publish or republish the score cutoff threshold."""
+    if req.threshold < 1 or req.threshold > 200:
+        raise HTTPException(status_code=400, detail="Threshold must be between 1 and 200.")
+    try:
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET ThresholdValue = :th, ThresholdPublished = :pub, ThresholdVisible = :vis',
+            ExpressionAttributeValues={
+                ':th': int(req.threshold),
+                ':pub': bool(req.published),
+                ':vis': bool(req.visible)
+            }
+        )
+        return {
+            'message': f'Threshold set to {req.threshold} successfully.',
+            'threshold': req.threshold,
+            'published': req.published,
+            'visible': req.visible
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.post("/settings/toggle-threshold")
+def toggle_threshold_visibility(req: ToggleThresholdRequest):
+    """Admin: toggle whether the threshold shortlisted teams are shown to users."""
+    try:
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression='SET ThresholdVisible = :vis',
+            ExpressionAttributeValues={':vis': bool(req.visible)}
+        )
+        return {'message': 'Threshold visibility updated.', 'visible': req.visible}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.get("/threshold/public")
+def get_public_threshold():
+    """
+    Participant-facing endpoint: returns the cutoff threshold and qualified teams
+    only if threshold is published and visible.
+    """
+    try:
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        raw_settings = settings_res.get('Item', {})
+        published = bool(raw_settings.get('ThresholdPublished', False))
+        visible = bool(raw_settings.get('ThresholdVisible', False))
+        threshold_val = int(raw_settings.get('ThresholdValue', 0))
+
+        if not (published and visible and threshold_val > 0):
+            return {
+                'published': published,
+                'visible': visible,
+                'threshold': threshold_val,
+                'count': 0,
+                'qualified_teams': []
+            }
+
+        full_data = compute_leaderboard_payload(raw_settings, True)
+        overall = full_data.get('overall', [])
+        qualified = [t for t in overall if int(t.get('score', 0)) >= threshold_val]
+
+        return {
+            'published': published,
+            'visible': visible,
+            'threshold': threshold_val,
+            'count': len(qualified),
+            'qualified_teams': qualified
+        }
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+def compute_leaderboard_payload(settings: dict, leaderboard_visible: bool):
+    team_reviews = settings.get('TeamReviewScores', {})
+    legacy_jury_scores = settings.get('JuryScores', {})
+
+    # Fetch all registered teams
+    teams_res = table.scan()
+    teams = [
+        t for t in teams_res.get('Items', [])
+        if t.get('TeamID') not in ('SYSTEM_SETTINGS',)
+    ]
+    team_map = {t['TeamID']: t for t in teams}
+
+    # Collect all scored team IDs
+    scored_ids = set(team_reviews.keys())
+    for k in legacy_jury_scores.keys():
+        parts = k.split('_')
+        if len(parts) >= 2:
+            scored_ids.add(parts[1])
+
+    all_entries = []
+    for tid in scored_ids:
+        t = team_map.get(tid, {})
+        trec = team_reviews.get(tid)
+        if trec:
+            r1 = trec.get('review1')
+            r2 = trec.get('review2')
+            r1_total = r1.get('total', 0) if r1 else 0
+            r2_total = r2.get('total', 0) if r2 else 0
+            total_marks = trec.get('total_score', r1_total + r2_total)
+            reviews_done = (1 if r1 else 0) + (1 if r2 else 0)
+        else:
+            matching_legacy = [v for k, v in legacy_jury_scores.items() if f"_{tid}" in k]
+            total_marks = sum(v.get('total', 0) for v in matching_legacy)
+            r1_total = total_marks
+            r2_total = 0
+            reviews_done = len(matching_legacy)
+
+        all_entries.append({
+            'team_id':          tid,
+            'team_name':        t.get('Team Name') or t.get('TeamName') or tid,
+            'assigned_problem': t.get('AdminAssignedProblem', ''),
+            'assigned_title':   t.get('AdminAssignedProblemTitle', ''),
+            'sdg_id':           t.get('AdminAssignedSdgId', ''),
+            'score':            total_marks,
+            'avg_score':        total_marks,
+            'r1_score':         r1_total,
+            'r2_score':         r2_total,
+            'jury_count':       reviews_done,
+        })
+
+    overall = sorted(all_entries, key=lambda x: x['score'], reverse=True)
+
+    for i, entry in enumerate(overall):
+        entry['overall_rank'] = i + 1
+
+    top3_overall_ids = {e['team_id'] for e in overall[:3]}
+
+    SDG_IDS = ['SDG2', 'SDG3', 'SDG4', 'SDG6', 'SDG11', 'SDG13', 'HARDWARE']
+    sdg_boards = {}
+    for sdg_id in SDG_IDS:
+        # Exclude teams present in overall leaderboard (Top 3 Overall) so the next team gets the rank
+        sdg_entries = [e for e in overall if e.get('sdg_id') == sdg_id and e['team_id'] not in top3_overall_ids]
+        for i, entry in enumerate(sdg_entries):
+            entry_copy = dict(entry)
+            entry_copy['sdg_rank'] = i + 1
+            entry_copy['excluded_from_top3_display'] = False
+            sdg_entries[i] = entry_copy
+
+        sdg_boards[sdg_id] = sdg_entries
+
+    return {
+        'visible':   leaderboard_visible,
+        'overall':   overall,
+        'sdg':       sdg_boards,
+        'by_sdg':    sdg_boards,
+    }
+
+
+@app.get("/leaderboard")
+def get_leaderboard_public():
+    """
+    Computes and returns the participant-facing leaderboard.
+    If LeaderboardVisible is False, returns empty scores so participants cannot view early results.
+    """
+    try:
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        settings = settings_res.get('Item', {})
+        leaderboard_visible = bool(settings.get('LeaderboardVisible', False))
+        if not leaderboard_visible:
+            return {
+                'visible': False,
+                'overall': [],
+                'sdg': {},
+                'by_sdg': {},
+                'message': 'Leaderboards are currently sealed by event administrators.'
+            }
+        return compute_leaderboard_payload(settings, True)
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.get("/leaderboard/data")
+def get_leaderboard_admin():
+    """
+    Computes and returns the complete leaderboard data for the Admin console.
+    Always returns computed scores regardless of participant visibility.
+    """
+    try:
+        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
+        settings = settings_res.get('Item', {})
+        leaderboard_visible = bool(settings.get('LeaderboardVisible', False))
+        return compute_leaderboard_payload(settings, leaderboard_visible)
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
 
 if __name__ == "__main__":
     import uvicorn
