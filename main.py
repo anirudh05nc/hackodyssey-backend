@@ -1254,7 +1254,7 @@ def submit_team_review(team_id: str, req: TeamReviewRequest):
     try:
         table.update_item(
             Key={'TeamID': team_id},
-            UpdateExpression="set EvaluationStatus = :status, ReviewFeedback = :feedback, EvaluationScore = :score",
+            UpdateExpression="set EvaluationStatus = :status, ReviewFeedback = :feedback, EvaluationScore = :score, TotalScore = :score, TotalMarks = :score, Score = :score",
             ExpressionAttributeValues={
                 ':status': req.status,
                 ':feedback': req.feedback,
@@ -2101,15 +2101,59 @@ def submit_jury_score(req: JuryScoreSubmit):
             ExpressionAttributeValues={':val': score_entry}
         )
 
-        # Mirror score onto the team item directly in DynamoDB for redundant persistence
+        # Store all marks fields directly onto the team's item in DynamoDB
         try:
+            update_parts = [
+                "EvaluationScore = :total",
+                "TotalScore = :total",
+                "TotalMarks = :total",
+                "Score = :total",
+                "Review1Score = :r1_tot",
+                "Review2Score = :r2_tot",
+                "ReviewScores = :rs",
+                "EvaluationStatus = :eval_status",
+                "LastEvaluatedAt = :ts",
+                "LastJurorID = :juror"
+            ]
+            expr_vals = {
+                ':total': total_for_200,
+                ':r1_tot': r1_val,
+                ':r2_tot': r2_val,
+                ':rs': current_team_rec,
+                ':eval_status': 'EVALUATED',
+                ':ts': int(time.time()),
+                ':juror': req.juror_id
+            }
+
+            if round_key == "review1":
+                update_parts.extend([
+                    "Review1_Innovation = :r1_inno",
+                    "Review1_Execution = :r1_exec",
+                    "Review1_Impact = :r1_imp",
+                    "Review1_Presentation = :r1_pres",
+                    "Review1_Total = :r1_tot"
+                ])
+                expr_vals[':r1_inno'] = req.innovation
+                expr_vals[':r1_exec'] = req.execution
+                expr_vals[':r1_imp'] = req.impact
+                expr_vals[':r1_pres'] = req.presentation
+            elif round_key == "review2":
+                update_parts.extend([
+                    "Review2_Innovation = :r2_inno",
+                    "Review2_Execution = :r2_exec",
+                    "Review2_Impact = :r2_imp",
+                    "Review2_Presentation = :r2_pres",
+                    "Review2_Total = :r2_tot"
+                ])
+                expr_vals[':r2_inno'] = req.innovation
+                expr_vals[':r2_exec'] = req.execution
+                expr_vals[':r2_imp'] = req.impact
+                expr_vals[':r2_pres'] = req.presentation
+
             table.update_item(
                 Key={'TeamID': req.team_id},
-                UpdateExpression='SET EvaluationScore = :score, ReviewScores = :rs',
-                ExpressionAttributeValues={
-                    ':score': total_for_200,
-                    ':rs': current_team_rec
-                }
+                UpdateExpression="SET " + ", ".join(update_parts),
+                ExpressionAttributeValues=expr_vals
             )
         except Exception as team_upd_err:
             print(f"Notice updating team item review score: {team_upd_err}")
