@@ -1035,6 +1035,20 @@ def purge_all_certificates(req: PurgeAllCertsRequest):
 
 
 
+# Target S3 buckets helper
+def get_target_s3_buckets() -> list:
+    """
+    Returns list of target S3 buckets to synchronize files with.
+    Ensures euphoria26-certificates is always updated alongside active S3_BUCKET and hackodyssey-certificates.
+    """
+    buckets = [S3_BUCKET, "euphoria26-certificates", "hackodyssey-certificates"]
+    unique = []
+    for b in buckets:
+        if b and b not in unique:
+            unique.append(b)
+    return unique
+
+
 # S3 key for the problem statements CSV
 PROBLEMS_CSV_S3_KEY = "problemstatements/problems.csv"
 
@@ -1044,6 +1058,7 @@ async def upload_problems_csv_direct(request: Request):
     """
     Direct server-side upload of Problem Statements CSV to S3.
     Bypasses browser-to-S3 CORS and signature restrictions.
+    Synchronizes across euphoria26-certificates and target buckets.
     Accepts JSON {"csv_content": "..."}, multipart FormData with file, or raw text.
     """
     csv_content = ""
@@ -1087,44 +1102,61 @@ async def upload_problems_csv_direct(request: Request):
     if not csv_content or not csv_content.strip():
         raise HTTPException(status_code=400, detail="CSV content cannot be empty.")
 
-    try:
+    # Validate and parse problem statement rows
+    parsed_items = _parse_problems_csv(csv_content)
+    if not parsed_items:
+        raise HTTPException(status_code=400, detail="Uploaded CSV contains no valid problem statement records. Please verify headers.")
+
+    saved_buckets = []
+    target_buckets = get_target_s3_buckets()
+    for b in target_buckets:
         try:
             s3_client.put_object(
-                Bucket=S3_BUCKET,
+                Bucket=b,
                 Key=PROBLEMS_CSV_S3_KEY,
                 Body=csv_content.encode('utf-8'),
                 ContentType='text/csv'
             )
+            saved_buckets.append(b)
         except ClientError as s3_err:
             err_code = s3_err.response.get('Error', {}).get('Code')
             if err_code in ('NoSuchBucket', '404'):
-                ensure_s3_bucket_exists()
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=PROBLEMS_CSV_S3_KEY,
-                    Body=csv_content.encode('utf-8'),
-                    ContentType='text/csv'
-                )
+                try:
+                    ensure_s3_bucket_exists()
+                    s3_client.put_object(
+                        Bucket=b,
+                        Key=PROBLEMS_CSV_S3_KEY,
+                        Body=csv_content.encode('utf-8'),
+                        ContentType='text/csv'
+                    )
+                    saved_buckets.append(b)
+                except Exception as inner_e:
+                    print(f"Notice: S3 write retry to bucket {b} failed: {inner_e}")
             else:
-                raise s3_err
+                print(f"Notice: S3 write to bucket {b} returned: {s3_err}")
+        except Exception as e:
+            print(f"Notice: S3 write to bucket {b} failed: {e}")
 
+    if not saved_buckets:
+        raise HTTPException(status_code=500, detail="Failed to store problem statements CSV in S3 buckets.")
+
+    # Update DynamoDB SYSTEM_SETTINGS
+    try:
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
             UpdateExpression="set ProblemsCsvUploaded = :val",
             ExpressionAttributeValues={':val': True}
         )
-        invalidate_problems_cache()
-        return {
-            "message": "Problem statements CSV uploaded successfully.",
-            "s3_key": PROBLEMS_CSV_S3_KEY
-        }
-    except ClientError as e:
-        error_msg = e.response.get('Error', {}).get('Message', str(e))
-        print(f"Error in upload_problems_csv_direct: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"S3 Error: {error_msg}")
     except Exception as e:
-        print(f"Unexpected error in upload_problems_csv_direct: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Notice: Updating SYSTEM_SETTINGS for problems upload failed: {e}")
+
+    invalidate_problems_cache()
+    return {
+        "message": f"Problem statements CSV ({len(parsed_items)} items) successfully saved to S3.",
+        "s3_key": PROBLEMS_CSV_S3_KEY,
+        "buckets": saved_buckets,
+        "count": len(parsed_items)
+    }
 
 
 @app.post("/api/problems/upload-csv")
@@ -1144,7 +1176,6 @@ def get_problems_csv_upload_url():
             },
             ExpiresIn=3600
         )
-        # Mark as uploaded in system settings (optimistic — actual S3 write happens client-side)
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
             UpdateExpression="set ProblemsCsvUploaded = :val",
@@ -1163,20 +1194,20 @@ def get_problems_csv_upload_url():
 def get_problems_raw_csv():
     """
     Directly streams or returns the Problem Statements CSV text from S3 via backend,
-    avoiding browser S3 CORS issues.
+    checking all target buckets.
     """
-    try:
-        response = s3_client.get_object(
-            Bucket=S3_BUCKET,
-            Key=PROBLEMS_CSV_S3_KEY
-        )
-        content = response['Body'].read().decode('utf-8')
-        return {"csv_content": content}
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', '')
-        if error_code == 'NoSuchKey':
-            raise HTTPException(status_code=404, detail="Problem statements CSV has not been uploaded yet.")
-        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+    for b in get_target_s3_buckets():
+        try:
+            response = s3_client.get_object(
+                Bucket=b,
+                Key=PROBLEMS_CSV_S3_KEY
+            )
+            content = response['Body'].read().decode('utf-8')
+            if content and content.strip():
+                return {"csv_content": content, "source_bucket": b}
+        except Exception:
+            continue
+    raise HTTPException(status_code=404, detail="Problem statements CSV has not been uploaded yet.")
 
 
 @app.get("/api/problems/csv")
@@ -1186,7 +1217,6 @@ def get_problems_csv_download_url():
     problem statements CSV directly from S3.
     """
     try:
-        # Check if CSV has been uploaded
         settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
         settings_item = settings_res.get('Item', {})
         if not settings_item.get('ProblemsCsvUploaded', False):
@@ -1207,22 +1237,40 @@ def get_problems_csv_download_url():
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
 
 
+@app.post("/api/problems/reset")
+@app.delete("/api/problems/reset")
 @app.post("/api/problems/reset-csv")
+@app.delete("/api/problems/reset-csv")
 def reset_problems_csv():
     """
-    Admin-only: Marks ProblemsCsvUploaded = False so the admin can re-upload.
-    Also disables SelectionEnabled to maintain gate order.
+    Admin-only: Deletes Problem Statements CSV from all target S3 buckets,
+    marks ProblemsCsvUploaded = False, and disables SelectionEnabled.
     """
+    deleted_buckets = []
+    for b in get_target_s3_buckets():
+        try:
+            s3_client.delete_object(
+                Bucket=b,
+                Key=PROBLEMS_CSV_S3_KEY
+            )
+            deleted_buckets.append(b)
+        except Exception as e:
+            print(f"Notice: S3 delete from bucket {b} failed: {e}")
+
     try:
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
-            UpdateExpression="set ProblemsCsvUploaded = :val, SelectionEnabled = :sel",
-            ExpressionAttributeValues={':val': False, ':sel': False}
+            UpdateExpression="set ProblemsCsvUploaded = :val, SelectionEnabled = :sel, ProblemsData = :empty",
+            ExpressionAttributeValues={':val': False, ':sel': False, ':empty': []}
         )
-        invalidate_problems_cache()
-        return {"message": "Problems CSV status reset. Admin must re-upload to enable selection."}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+    invalidate_problems_cache()
+    return {
+        "message": "Problem statements CSV successfully deleted from S3 and selection gate reset.",
+        "deleted_buckets": deleted_buckets
+    }
 
 
 @app.post("/teams/{team_id}/submit-link")
@@ -1771,41 +1819,90 @@ def initialize_teams():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_sdg_id(raw: str) -> str:
-    """Normalise sdg_id; unknown values fall back to HARDWARE."""
-    normalised = (raw or '').strip().upper()
+    """Normalise sdg_id; handles casing, spaces, dashes, and semantic keywords."""
+    normalised = (raw or '').strip().upper().replace(" ", "").replace("-", "").replace("_", "")
+    if normalised in VALID_SDG_IDS:
+        return normalised
+    mapping = {
+        '2': 'SDG2', 'HUNGER': 'SDG2', 'AGRICULTURE': 'SDG2', 'AGRI': 'SDG2',
+        '3': 'SDG3', 'HEALTH': 'SDG3', 'WELLBEING': 'SDG3', 'MEDICAL': 'SDG3',
+        '4': 'SDG4', 'EDUCATION': 'SDG4', 'LEARNING': 'SDG4',
+        '6': 'SDG6', 'WATER': 'SDG6', 'SANITATION': 'SDG6',
+        '11': 'SDG11', 'CITIES': 'SDG11', 'COMMUNITIES': 'SDG11', 'URBAN': 'SDG11',
+        '13': 'SDG13', 'CLIMATE': 'SDG13', 'ENVIRONMENT': 'SDG13',
+        'HW': 'HARDWARE', 'HARDWARE': 'HARDWARE', 'IOT': 'HARDWARE', 'ROBOTICS': 'HARDWARE'
+    }
+    for k, v in mapping.items():
+        if k in normalised:
+            return v
     return normalised if normalised in VALID_SDG_IDS else 'HARDWARE'
 
 
 def _parse_problems_csv(csv_text: str) -> list:
     """Parse raw CSV text into a list of problem-statement dicts with category."""
     import io
+    if not csv_text or not csv_text.strip():
+        return []
+    # Strip UTF-8 BOM if present
+    if csv_text.startswith('\ufeff'):
+        csv_text = csv_text[1:]
     reader = csv.DictReader(io.StringIO(csv_text))
     problems = []
     for row in reader:
-        # Support flexible header capitalisation
+        if not row:
+            continue
+        clean_row = {str(k).strip().lower().replace(' ', '_').replace('-', '_'): (str(v).strip() if v is not None else '') for k, v in row.items() if k is not None}
+        
         sdg_raw = (
-            row.get('sdg_id') or row.get('SDG_ID') or row.get('SdgId') or
-            row.get('sdg') or row.get('SDG') or ''
-        ).strip()
+            clean_row.get('sdg_id') or clean_row.get('sdgid') or clean_row.get('sdg') or 
+            clean_row.get('category') or clean_row.get('domain') or clean_row.get('track') or ''
+        )
         sdg_id = _resolve_sdg_id(sdg_raw)
-        problems.append({
-            'problem_id':   (row.get('problem_id') or row.get('ProblemID') or row.get('id') or '').strip(),
-            'sdg_id':       sdg_id,
-            'category':     SDG_CATEGORY_LABELS.get(sdg_id, 'Hardware'),
-            'title':        (row.get('title') or row.get('Title') or '').strip(),
-            'description':  (row.get('description') or row.get('Description') or '').strip(),
-            'requirements': (row.get('requirements') or row.get('Requirements') or '').strip(),
-            'expectations': (row.get('expectations') or row.get('Expectations') or '').strip(),
-        })
-    return [p for p in problems if p['problem_id'] or p['title']]
+        
+        prob_id = (
+            clean_row.get('problem_id') or clean_row.get('problemid') or clean_row.get('id') or 
+            clean_row.get('code') or clean_row.get('track_id') or ''
+        )
+        
+        title = (
+            clean_row.get('title') or clean_row.get('problem_title') or clean_row.get('problemtitle') or 
+            clean_row.get('name') or ''
+        )
+        
+        desc = (
+            clean_row.get('description') or clean_row.get('problem_description') or 
+            clean_row.get('problemdescription') or clean_row.get('desc') or clean_row.get('details') or ''
+        )
+        
+        reqs = (
+            clean_row.get('requirements') or clean_row.get('requirement') or clean_row.get('tech_stack') or 
+            clean_row.get('stack') or clean_row.get('prerequisites') or ''
+        )
+        
+        exps = (
+            clean_row.get('expectations') or clean_row.get('expectation') or clean_row.get('deliverables') or 
+            clean_row.get('outcomes') or ''
+        )
+        
+        if prob_id or title:
+            problems.append({
+                'problem_id':   prob_id,
+                'sdg_id':       sdg_id,
+                'category':     SDG_CATEGORY_LABELS.get(sdg_id, 'Hardware'),
+                'title':        title,
+                'description':  desc,
+                'requirements': reqs,
+                'expectations': exps,
+            })
+    return problems
 
 
-# ── Problems In-Memory Cache (60s TTL) ──────────────────────────────────────
+# ── Problems In-Memory Cache (3s TTL for rapid propagation) ───────────────────
 _PROBLEMS_CACHE = {
     "data": None,
     "timestamp": 0.0
 }
-_PROBLEMS_CACHE_TTL = 60.0  # 60 seconds (1 minute cache)
+_PROBLEMS_CACHE_TTL = 3.0  # 3 seconds cache
 
 def invalidate_problems_cache():
     global _PROBLEMS_CACHE
@@ -1817,38 +1914,49 @@ def invalidate_problems_cache():
 def list_problems():
     """
     Returns merged problem statements:
-    1. Problems from S3 CSV (canonical source)
+    1. Problems from S3 CSV (checking euphoria26-certificates, S3_BUCKET, and target buckets)
     2. Inline-added problems stored in SYSTEM_SETTINGS.ProblemsData
     Categorised by sdg_id at response time.
-    Cached for 60 seconds to provide instant (<1ms) response times.
     """
     global _PROBLEMS_CACHE
     now = time.time()
     if _PROBLEMS_CACHE["data"] is not None and (now - _PROBLEMS_CACHE["timestamp"] < _PROBLEMS_CACHE_TTL):
         return _PROBLEMS_CACHE["data"]
 
-    problems = []
-
-    # 1. From S3 CSV
-    try:
-        resp = s3_client.get_object(Bucket=S3_BUCKET, Key=PROBLEMS_CSV_S3_KEY)
-        csv_text = resp['Body'].read().decode('utf-8')
-        problems.extend(_parse_problems_csv(csv_text))
-    except ClientError as e:
-        if e.response.get('Error', {}).get('Code') != 'NoSuchKey':
-            raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
-
-    # 2. From inline adds stored in DynamoDB SYSTEM_SETTINGS
+    is_uploaded = True
+    inline = []
     try:
         settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
-        inline = settings_res.get('Item', {}).get('ProblemsData', [])
-        # De-duplicate by problem_id vs CSV
-        csv_ids = {p['problem_id'] for p in problems}
+        settings_item = settings_res.get('Item', {})
+        is_uploaded = bool(settings_item.get('ProblemsCsvUploaded', False))
+        inline = settings_item.get('ProblemsData', [])
+    except Exception as e:
+        print(f"Notice: Checking DynamoDB settings for problems: {e}")
+
+    problems = []
+
+    # 1. From S3 CSV if marked as uploaded or exists
+    if is_uploaded:
+        csv_text = None
+        for b in get_target_s3_buckets():
+            try:
+                resp = s3_client.get_object(Bucket=b, Key=PROBLEMS_CSV_S3_KEY)
+                text = resp['Body'].read().decode('utf-8')
+                if text and text.strip():
+                    csv_text = text
+                    break
+            except Exception:
+                continue
+
+        if csv_text:
+            problems.extend(_parse_problems_csv(csv_text))
+
+    # 2. From inline adds stored in DynamoDB SYSTEM_SETTINGS
+    if inline:
+        csv_ids = {p.get('problem_id') for p in problems if p.get('problem_id')}
         for p in inline:
             if p.get('problem_id') not in csv_ids:
                 problems.append(p)
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
 
     result = {'count': len(problems), 'problems': problems}
     _PROBLEMS_CACHE["data"] = result
@@ -1879,16 +1987,13 @@ def add_problem_inline(req: ProblemStatementItem):
     }
 
     try:
-        # Initialise ProblemsData list if absent
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
             UpdateExpression='SET ProblemsData = if_not_exists(ProblemsData, :empty)',
             ExpressionAttributeValues={':empty': []}
         )
-        # Fetch current list and append
         settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
         current = list(settings_res.get('Item', {}).get('ProblemsData', []))
-        # Prevent duplicate problem_ids
         current = [p for p in current if p.get('problem_id') != new_entry['problem_id']]
         current.append(new_entry)
         table.update_item(
@@ -1906,7 +2011,7 @@ def add_problem_inline(req: ProblemStatementItem):
 def seed_default_problems_to_s3():
     """
     Seeds default problem statements directly into AWS S3 at problemstatements/problems.csv.
-    Ensures S3 has canonical problem statements for the hackathon.
+    Ensures S3 has canonical problem statements for the hackathon across all target buckets.
     """
     sample_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_problems.csv")
     if not os.path.exists(sample_csv):
@@ -1916,12 +2021,18 @@ def seed_default_problems_to_s3():
         with open(sample_csv, "r", encoding="utf-8") as f:
             csv_content = f.read()
 
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=PROBLEMS_CSV_S3_KEY,
-            Body=csv_content.encode('utf-8'),
-            ContentType='text/csv'
-        )
+        saved_buckets = []
+        for b in get_target_s3_buckets():
+            try:
+                s3_client.put_object(
+                    Bucket=b,
+                    Key=PROBLEMS_CSV_S3_KEY,
+                    Body=csv_content.encode('utf-8'),
+                    ContentType='text/csv'
+                )
+                saved_buckets.append(b)
+            except Exception as e:
+                print(f"Seed to bucket {b} failed: {e}")
 
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
@@ -1931,11 +2042,11 @@ def seed_default_problems_to_s3():
         invalidate_problems_cache()
         return {
             "message": "Default problem statements seeded successfully into AWS S3.",
-            "s3_bucket": S3_BUCKET,
+            "s3_buckets": saved_buckets,
             "s3_key": PROBLEMS_CSV_S3_KEY
         }
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=e.response.get('Error', {}).get('Message', str(e)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
