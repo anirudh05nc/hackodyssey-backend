@@ -21,12 +21,9 @@ origins = [
     "http://hack26.anc-anirudh.online",
     "https://hackodyssey.gfgkare.in",
     "http://hackodyssey.gfgkare.in",
+    "https://hack26.gfgkare.in",
+    "http://hack26.gfgkare.in",
     "http://localhost:5173",
-    "http://localhost:3000",
-    "http://localhost:8000",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8000",
 ]
 
 # Enable Starlette CORS middleware with full wildcard origin regex support
