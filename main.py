@@ -807,21 +807,14 @@ def launch_timer(req: TimerLaunchRequest):
     import time
     expiry_time = int(time.time()) + req.duration
     try:
-        # Gate: timer can only be launched if selection is enabled
-        settings_res = table.get_item(Key={'TeamID': 'SYSTEM_SETTINGS'})
-        settings_item = settings_res.get('Item', {})
-        if not settings_item.get('SelectionEnabled', False):
-            raise HTTPException(
-                status_code=400,
-                detail="Action Denied: Selection Gate must be enabled before launching the timer. Enable the Selection Gate first."
-            )
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
-            UpdateExpression="set TimerLaunched = :l, TimerStartTime = :s, TimerDuration = :d",
+            UpdateExpression="set TimerLaunched = :l, TimerStartTime = :s, TimerDuration = :d, SelectionEnabled = :sel",
             ExpressionAttributeValues={
                 ':l': True,
                 ':s': expiry_time,
-                ':d': req.duration
+                ':d': req.duration,
+                ':sel': True
             }
         )
         return {"message": "Timer launched successfully.", "TimerStartTime": expiry_time, "TimerDuration": req.duration, "ServerTime": int(time.time())}
@@ -834,11 +827,12 @@ def reset_timer():
     try:
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
-            UpdateExpression="set TimerLaunched = :l, TimerStartTime = :s, TimerDuration = :d",
+            UpdateExpression="set TimerLaunched = :l, TimerStartTime = :s, TimerDuration = :d, SelectionEnabled = :sel",
             ExpressionAttributeValues={
                 ':l': False,
                 ':s': 0,
-                ':d': 0
+                ':d': 0,
+                ':sel': False
             }
         )
         return {"message": "Timer reset successfully."}
