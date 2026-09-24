@@ -1777,12 +1777,27 @@ def initialize_teams():
 
     # 2. Process CSV and group participants by TeamID
     csv_file_path = "euphoria26_participants.csv"
+    sample_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data")
     if not os.path.exists(csv_file_path):
-        sample_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_participants.csv")
+        sample_path = os.path.join(sample_dir, "dummy_participants.csv")
         if os.path.exists(sample_path):
             csv_file_path = sample_path
         else:
             return {"message": "System settings initialized in DynamoDB. Seed teams and participants via /seed-csv-data."}
+
+    # Pre-load team credentials and leader info from dummy_teams.csv if present
+    teams_meta = {}
+    teams_csv_sample = os.path.join(sample_dir, "dummy_teams.csv")
+    if os.path.exists(teams_csv_sample):
+        try:
+            with open(teams_csv_sample, mode='r', encoding='utf-8') as tf:
+                t_reader = csv.DictReader(tf)
+                for tr in t_reader:
+                    tid = str(tr.get("TeamID") or "").strip()
+                    if tid:
+                        teams_meta[tid] = tr
+        except Exception:
+            pass
 
     teams_data = {}
     
@@ -1795,13 +1810,19 @@ def initialize_teams():
                     continue
                 
                 if team_id not in teams_data:
+                    meta = teams_meta.get(team_id, {})
                     teams_data[team_id] = {
                         "TeamID": team_id,
-                        "TeamName": row.get("TeamName", f"Team {team_id}"),
-                        "Password": row.get("Password", "default_password"),
-                        "TransactionStatus": row.get("TransactionStatus", "SUCCESS"),
-                        "SubmittedTimestamp": row.get("SubmittedTimestamp", ""),
-                        "SelectedProblem": row.get("SelectedProblem", ""),
+                        "TeamName": meta.get("Team Name") or row.get("TeamName") or f"Team {team_id}",
+                        "Team Name": meta.get("Team Name") or row.get("TeamName") or f"Team {team_id}",
+                        "Password": meta.get("Password") or row.get("Password") or "hackodyssey2026",
+                        "Leader Name": meta.get("Leader Name") or row.get("Leader Name") or row.get("Name", ""),
+                        "Leader Email": meta.get("Leader Email") or row.get("Leader Email") or row.get("Email", ""),
+                        "Leader Phone": meta.get("Leader Phone") or row.get("Leader Phone") or row.get("Phone", ""),
+                        "Leader RegNo": meta.get("Leader RegNo") or row.get("Leader RegNo") or row.get("RegNo", ""),
+                        "TransactionStatus": meta.get("TransactionStatus") or row.get("TransactionStatus") or "SUCCESS",
+                        "SubmittedTimestamp": meta.get("SubmittedTimestamp") or row.get("SubmittedTimestamp") or "",
+                        "SelectedProblem": "",
                         "Participants": []
                     }
                 
