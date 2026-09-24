@@ -1732,7 +1732,29 @@ def delete_all_teams(req: DeleteAllRequest):
             table.delete_item(Key={'TeamID': team_id})
             deleted_count += 1
 
-        return {"message": f"Successfully purged {deleted_count} team records from the database."}
+        # Cleanly purge all jury review scores and legacy scores in SYSTEM_SETTINGS
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression="SET TeamReviewScores = :empty, JuryScores = :empty",
+            ExpressionAttributeValues={':empty': {}}
+        )
+
+        return {"message": f"Successfully purged {deleted_count} team records and all jury scores from the database."}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
+
+
+@app.post("/admin/reset-jury-scores")
+@app.post("/jury/reset-scores")
+def reset_all_jury_scores():
+    """Resets all jury evaluations and marks across the system."""
+    try:
+        table.update_item(
+            Key={'TeamID': 'SYSTEM_SETTINGS'},
+            UpdateExpression="SET TeamReviewScores = :empty, JuryScores = :empty",
+            ExpressionAttributeValues={':empty': {}}
+        )
+        return {"message": "All jury scores have been successfully reset."}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
 
@@ -2395,42 +2417,75 @@ def compute_leaderboard_payload(settings: dict, leaderboard_visible: bool):
     ]
     team_map = {t['TeamID']: t for t in teams}
 
-    # Collect all scored team IDs
-    scored_ids = set(team_reviews.keys())
-    for k in legacy_jury_scores.keys():
-        parts = k.split('_')
-        if len(parts) >= 2:
-            scored_ids.add(parts[1])
-
     all_entries = []
-    for tid in scored_ids:
-        t = team_map.get(tid, {})
+    # Only process registered teams that exist in the system
+    for tid, t in team_map.items():
         trec = team_reviews.get(tid)
-        if trec:
+        matching_legacy = [
+            v for k, v in legacy_jury_scores.items() 
+            if (k.startswith(f"jury1_{tid}") or k.startswith(f"jury2_{tid}") or k.startswith(f"jury3_{tid}") 
+                or f"_{tid}_" in k or k.endswith(f"_{tid}"))
+        ]
+        
+        # If no evaluations exist for this team, skip from leaderboard
+        if not trec and not matching_legacy:
+            continue
+
+        r1_totals = []
+        r2_totals = []
+        jurors_set = set()
+
+        if trec and isinstance(trec, dict):
             r1 = trec.get('review1')
             r2 = trec.get('review2')
-            r1_total = r1.get('total', 0) if r1 else 0
-            r2_total = r2.get('total', 0) if r2 else 0
-            total_marks = trec.get('total_score', r1_total + r2_total)
-            reviews_done = (1 if r1 else 0) + (1 if r2 else 0)
-        else:
-            matching_legacy = [v for k, v in legacy_jury_scores.items() if f"_{tid}" in k]
-            total_marks = sum(v.get('total', 0) for v in matching_legacy)
-            r1_total = total_marks
-            r2_total = 0
-            reviews_done = len(matching_legacy)
+            if r1 and isinstance(r1, dict) and r1.get('total') is not None:
+                r1_totals.append(float(r1['total']))
+                if r1.get('juror_id'):
+                    jurors_set.add(r1['juror_id'])
+            if r2 and isinstance(r2, dict) and r2.get('total') is not None:
+                r2_totals.append(float(r2['total']))
+                if r2.get('juror_id'):
+                    jurors_set.add(r2['juror_id'])
+
+        for leg in matching_legacy:
+            if isinstance(leg, dict):
+                tot = leg.get('total')
+                if tot is not None:
+                    rnd = leg.get('review_round', 'review1')
+                    if rnd == 'review2':
+                        r2_totals.append(float(tot))
+                    else:
+                        r1_totals.append(float(tot))
+                    if leg.get('juror_id'):
+                        jurors_set.add(leg['juror_id'])
+
+        # Compute average score per round (so multiple jurors are averaged out of 100, not summed)
+        r1_avg = round(sum(r1_totals) / len(r1_totals), 1) if r1_totals else 0.0
+        r2_avg = round(sum(r2_totals) / len(r2_totals), 1) if r2_totals else 0.0
+
+        # Total score: Review 1 average + Review 2 average (out of 200)
+        # If only Review 1 was evaluated, total is Review 1 average (out of 100)
+        total_score = round(r1_avg + r2_avg, 1)
+
+        # Count of distinct jurors who evaluated this team
+        jury_count = max(len(jurors_set), (1 if r1_totals else 0) + (1 if r2_totals else 0))
+
+        # Clean integer display if whole number (e.g. 91 instead of 91.0)
+        score_val = int(total_score) if total_score == int(total_score) else total_score
+        r1_val = int(r1_avg) if r1_avg == int(r1_avg) else r1_avg
+        r2_val = int(r2_avg) if r2_avg == int(r2_avg) else r2_avg
 
         all_entries.append({
             'team_id':          tid,
             'team_name':        t.get('Team Name') or t.get('TeamName') or tid,
-            'assigned_problem': t.get('AdminAssignedProblem', ''),
-            'assigned_title':   t.get('AdminAssignedProblemTitle', ''),
-            'sdg_id':           t.get('AdminAssignedSdgId', ''),
-            'score':            total_marks,
-            'avg_score':        total_marks,
-            'r1_score':         r1_total,
-            'r2_score':         r2_total,
-            'jury_count':       reviews_done,
+            'assigned_problem': t.get('AdminAssignedProblem') or t.get('SelectedProblem') or '',
+            'assigned_title':   t.get('AdminAssignedProblemTitle') or t.get('SelectedProblem') or '',
+            'sdg_id':           t.get('AdminAssignedSdgId') or t.get('SdgId') or 'GENERAL',
+            'score':            score_val,
+            'avg_score':        score_val,
+            'r1_score':         r1_val,
+            'r2_score':         r2_val,
+            'jury_count':       jury_count,
         })
 
     overall = sorted(all_entries, key=lambda x: x['score'], reverse=True)
