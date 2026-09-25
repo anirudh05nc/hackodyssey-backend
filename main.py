@@ -296,9 +296,9 @@ SDG_CATEGORY_LABELS = {
 }
 
 JURY_CREDENTIALS = {
-    'jury1': 'hack26jury',
-    'jury2': 'hack26jury',
-    'jury3': 'hack26jury',
+    'Gnana Sampath Sir': 'hack26jury',
+    'Sesu Raj Sir': 'hack26jury',
+    'Guest Jury': 'hack26jury',
 }
 
 class ProblemStatementItem(BaseModel):
