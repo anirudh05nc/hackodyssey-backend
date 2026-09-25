@@ -644,13 +644,31 @@ def select_problem(team_id: str, selection: ProblemSelection):
                 detail=f"Challenge '{selection.problem_title}' is full. Maximum 3 teams allowed."
             )
         
+        resolved_sdg, resolved_pid, resolved_title = lookup_sdg_for_problem(selection.problem_title)
+        update_expr = "set SelectedProblem = :val"
+        expr_vals = {':val': selection.problem_title}
+        if resolved_sdg and resolved_sdg != 'GENERAL':
+            update_expr += ", AdminAssignedSdgId = :sdg, SdgId = :sdg"
+            expr_vals[':sdg'] = resolved_sdg
+        if resolved_pid:
+            update_expr += ", AdminAssignedProblem = :pid"
+            expr_vals[':pid'] = resolved_pid
+        if resolved_title:
+            update_expr += ", AdminAssignedProblemTitle = :ptitle"
+            expr_vals[':ptitle'] = resolved_title
+
         table.update_item(
             Key={'TeamID': team_id},
-            UpdateExpression="set SelectedProblem = :val",
-            ExpressionAttributeValues={':val': selection.problem_title}
+            UpdateExpression=update_expr,
+            ExpressionAttributeValues=expr_vals
         )
         
-        return {"message": "Problem selection locked successfully.", "selected_problem": selection.problem_title}
+        return {
+            "message": "Problem selection locked successfully.",
+            "selected_problem": selection.problem_title,
+            "sdg_id": resolved_sdg,
+            "problem_id": resolved_pid
+        }
     except ClientError as e:
         raise HTTPException(status_code=500, detail=e.response['Error']['Message'])
 
@@ -1923,6 +1941,47 @@ def _resolve_sdg_id(raw: str) -> str:
     return normalised if normalised in VALID_SDG_IDS else 'HARDWARE'
 
 
+def _normalize_prob_text(s: str) -> str:
+    if not s:
+        return ""
+    import re
+    s = str(s).replace('\xa0', ' ').replace('\u00a0', ' ')
+    return re.sub(r'\s+', ' ', s).strip().lower()
+
+
+def lookup_sdg_for_problem(problem_title: str = "", problem_id: str = ""):
+    """
+    Returns (sdg_id, canonical_problem_id, canonical_title)
+    Resolves using canonical problem statement list.
+    """
+    p_norm = _normalize_prob_text(problem_title)
+    pid_norm = _normalize_prob_text(problem_id)
+    
+    # 1. Search in list_problems()
+    try:
+        all_probs = list_problems().get('problems', [])
+        for p in all_probs:
+            cur_pid = _normalize_prob_text(p.get('problem_id', ''))
+            cur_title = _normalize_prob_text(p.get('title', ''))
+            if pid_norm and cur_pid == pid_norm:
+                return (p.get('sdg_id') or 'GENERAL', p.get('problem_id', ''), p.get('title', ''))
+            if p_norm and cur_title == p_norm:
+                return (p.get('sdg_id') or 'GENERAL', p.get('problem_id', ''), p.get('title', ''))
+        # Substring search
+        for p in all_probs:
+            cur_title = _normalize_prob_text(p.get('title', ''))
+            if (p_norm and len(p_norm) > 6 and p_norm in cur_title) or (cur_title and len(cur_title) > 6 and cur_title in p_norm):
+                return (p.get('sdg_id') or 'GENERAL', p.get('problem_id', ''), p.get('title', ''))
+    except Exception as e:
+        print(f"Notice during lookup_sdg_for_problem: {e}")
+        
+    # 2. Hardware heuristics
+    if 'water quality and level monitoring' in p_norm or 'hardware' in pid_norm or 'prb-hw' in pid_norm:
+        return ('HARDWARE', problem_id or 'PRB-HARDWARE', problem_title or 'Hardware Track')
+        
+    return ('GENERAL', problem_id, problem_title)
+
+
 def _parse_problems_csv(csv_text: str) -> list:
     """Parse raw CSV text into a list of problem-statement dicts with category."""
     import io
@@ -2043,6 +2102,18 @@ def list_problems():
             if p.get('problem_id') not in csv_ids:
                 problems.append(p)
 
+    # 3. Fallback to local problem_statements.csv
+    if not problems:
+        local_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "problem_statements.csv")
+        if not os.path.exists(local_csv):
+            local_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_problems.csv")
+        if os.path.exists(local_csv):
+            try:
+                with open(local_csv, "r", encoding="utf-8-sig") as f:
+                    problems.extend(_parse_problems_csv(f.read()))
+            except Exception as e:
+                print(f"Notice: local problems CSV fallback: {e}")
+
     result = {'count': len(problems), 'problems': problems}
     _PROBLEMS_CACHE["data"] = result
     _PROBLEMS_CACHE["timestamp"] = now
@@ -2098,12 +2169,14 @@ def seed_default_problems_to_s3():
     Seeds default problem statements directly into AWS S3 at problemstatements/problems.csv.
     Ensures S3 has canonical problem statements for the hackathon across all target buckets.
     """
-    sample_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_problems.csv")
+    sample_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "problem_statements.csv")
+    if not os.path.exists(sample_csv):
+        sample_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_data", "dummy_problems.csv")
     if not os.path.exists(sample_csv):
         raise HTTPException(status_code=404, detail="Default problems CSV template not found on server.")
     
     try:
-        with open(sample_csv, "r", encoding="utf-8") as f:
+        with open(sample_csv, "r", encoding="utf-8-sig") as f:
             csv_content = f.read()
 
         saved_buckets = []
@@ -2647,12 +2720,27 @@ def compute_leaderboard_payload(settings: dict, leaderboard_visible: bool):
         r1_val = int(r1_avg) if r1_avg == int(r1_avg) else r1_avg
         r2_val = int(r2_avg) if r2_avg == int(r2_avg) else r2_avg
 
+        assigned_problem = t.get('AdminAssignedProblem') or t.get('SelectedProblem') or ''
+        assigned_title = t.get('AdminAssignedProblemTitle') or t.get('SelectedProblem') or ''
+        sdg_id = t.get('AdminAssignedSdgId') or t.get('SdgId')
+
+        if not sdg_id or sdg_id == 'GENERAL':
+            resolved_sdg, resolved_pid, resolved_title = lookup_sdg_for_problem(assigned_title or assigned_problem, assigned_problem)
+            if resolved_sdg and resolved_sdg != 'GENERAL':
+                sdg_id = resolved_sdg
+                if not assigned_problem and resolved_pid:
+                    assigned_problem = resolved_pid
+                if not assigned_title and resolved_title:
+                    assigned_title = resolved_title
+            else:
+                sdg_id = 'GENERAL'
+
         all_entries.append({
             'team_id':          tid,
             'team_name':        t.get('Team Name') or t.get('TeamName') or tid,
-            'assigned_problem': t.get('AdminAssignedProblem') or t.get('SelectedProblem') or '',
-            'assigned_title':   t.get('AdminAssignedProblemTitle') or t.get('SelectedProblem') or '',
-            'sdg_id':           t.get('AdminAssignedSdgId') or t.get('SdgId') or 'GENERAL',
+            'assigned_problem': assigned_problem,
+            'assigned_title':   assigned_title,
+            'sdg_id':           sdg_id,
             'score':            score_val,
             'avg_score':        score_val,
             'r1_score':         r1_val,
