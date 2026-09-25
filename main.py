@@ -299,6 +299,30 @@ JURY_CREDENTIALS = {
     'Gnana Sampath Sir': 'hack26jury',
     'Sesu Raj Sir': 'hack26jury',
     'Guest Jury': 'hack26jury',
+    # Lowercase forms
+    'gnana sampath sir': 'hack26jury',
+    'sesu raj sir': 'hack26jury',
+    'guest jury': 'hack26jury',
+    # Convenient short aliases
+    'gnana': 'hack26jury',
+    'sesu': 'hack26jury',
+    'guest': 'hack26jury',
+    # Legacy aliases
+    'jury1': 'hack26jury',
+    'jury2': 'hack26jury',
+    'jury3': 'hack26jury',
+}
+
+CANONICAL_JURY_MAP = {
+    'gnana sampath sir': 'Gnana Sampath Sir',
+    'sesu raj sir': 'Sesu Raj Sir',
+    'guest jury': 'Guest Jury',
+    'gnana': 'Gnana Sampath Sir',
+    'sesu': 'Sesu Raj Sir',
+    'guest': 'Guest Jury',
+    'jury1': 'Gnana Sampath Sir',
+    'jury2': 'Sesu Raj Sir',
+    'jury3': 'Guest Jury',
 }
 
 class ProblemStatementItem(BaseModel):
@@ -2177,11 +2201,26 @@ def assign_problem_to_team(team_id: str, req: AssignProblemRequest):
 
 @app.post("/jury/login")
 def jury_login(req: JuryLoginRequest):
-    """Validates jury credentials. Returns juror_id on success."""
-    expected = JURY_CREDENTIALS.get(req.username.strip().lower())
-    if not expected or req.password != expected:
+    """Validates jury credentials. Returns canonical juror_id on success."""
+    input_user = (req.username or "").strip()
+    input_key = input_user.lower()
+
+    expected = None
+    canonical_id = CANONICAL_JURY_MAP.get(input_key, input_user)
+
+    for k, v in JURY_CREDENTIALS.items():
+        if k.lower() == input_key:
+            expected = v
+            if input_key in CANONICAL_JURY_MAP:
+                canonical_id = CANONICAL_JURY_MAP[input_key]
+            else:
+                canonical_id = k
+            break
+
+    if not expected or req.password.strip() != expected:
         raise HTTPException(status_code=401, detail='Invalid jury credentials.')
-    return {'ok': True, 'juror_id': req.username.strip().lower()}
+
+    return {'ok': True, 'juror_id': canonical_id}
 
 
 @app.post("/jury/score")
@@ -2192,8 +2231,13 @@ def submit_jury_score(req: JuryScoreSubmit):
     ensuring that when one juror allocates marks, it syncs across all juror portals.
     Total score for a team is computed out of 200 (Review 1 max 100 + Review 2 max 100).
     """
-    if req.juror_id not in JURY_CREDENTIALS:
+    raw_juror = (req.juror_id or "").strip()
+    juror_lower = raw_juror.lower()
+    is_valid_juror = any(k.lower() == juror_lower for k in JURY_CREDENTIALS)
+    if not is_valid_juror:
         raise HTTPException(status_code=401, detail='Invalid juror ID.')
+
+    canonical_juror = CANONICAL_JURY_MAP.get(juror_lower, raw_juror)
 
     round_key = req.review_round.strip().lower() if getattr(req, 'review_round', None) else "review1"
     if round_key not in ("review1", "review2"):
@@ -2244,7 +2288,7 @@ def submit_jury_score(req: JuryScoreSubmit):
             'presentation':             c4,
             'total':                    total,
             'submitted_at':             int(time.time()),
-            'juror_id':                 req.juror_id,
+            'juror_id':                 canonical_juror,
             'team_id':                  req.team_id,
             'review_round':             round_key,
         }
@@ -2288,7 +2332,7 @@ def submit_jury_score(req: JuryScoreSubmit):
             'presentation':            c4,
             'total':                   total,
             'submitted_at':            int(time.time()),
-            'juror_id':                req.juror_id,
+            'juror_id':                canonical_juror,
             'team_id':                 req.team_id,
             'review_round':            round_key,
         }
@@ -2316,7 +2360,7 @@ def submit_jury_score(req: JuryScoreSubmit):
         current_team_rec['r1_total'] = r1_val
         current_team_rec['r2_total'] = r2_val
         current_team_rec['last_updated_at'] = int(time.time())
-        current_team_rec['last_juror_id'] = req.juror_id
+        current_team_rec['last_juror_id'] = canonical_juror
 
         # Update TeamReviewScores map in DynamoDB
         table.update_item(
@@ -2332,7 +2376,7 @@ def submit_jury_score(req: JuryScoreSubmit):
         )
 
         # Legacy backward-compatibility in JuryScores
-        legacy_key = f"{req.juror_id}_{req.team_id}_{round_key}"
+        legacy_key = f"{canonical_juror}_{req.team_id}_{round_key}"
         table.update_item(
             Key={'TeamID': 'SYSTEM_SETTINGS'},
             UpdateExpression='SET JuryScores = if_not_exists(JuryScores, :empty)',
@@ -2366,7 +2410,7 @@ def submit_jury_score(req: JuryScoreSubmit):
                 ':rs': current_team_rec,
                 ':eval_status': 'EVALUATED',
                 ':ts': int(time.time()),
-                ':juror': req.juror_id
+                ':juror': canonical_juror
             }
 
             if round_key == "review1":
