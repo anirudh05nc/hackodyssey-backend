@@ -1,11 +1,11 @@
 import os
 import csv
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import boto3
 from botocore.exceptions import ClientError
 
@@ -319,13 +319,40 @@ class JuryLoginRequest(BaseModel):
     password: str
 
 class JuryScoreSubmit(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     juror_id: str
     team_id: str
     review_round: Optional[str] = "review1"
-    innovation: int     # 0-25
-    execution: int      # 0-25
-    impact: int         # 0-25
-    presentation: int   # 0-25
+    
+    # Review 1 criteria (0-25 each):
+    # 1. Problem Identification & Importance
+    # 2. Alignment with Selected SDG Goals
+    # 3. Innovation / Uniqueness of Idea
+    # 4. Feasibility & Practicality of Solution
+    problem_identification: Optional[int] = None
+    sdg_alignment: Optional[int] = None
+    innovation_uniqueness: Optional[int] = None
+    feasibility_practicality: Optional[int] = None
+
+    # Review 2 criteria (0-25 each):
+    # 1. System Architecture / Design Clarity
+    # 2. Technical Approach & Tools Used
+    # 3. Development Progress During Hackathon
+    # 4. Team Collaboration & Task Distribution
+    system_architecture: Optional[int] = None
+    technical_approach: Optional[int] = None
+    development_progress: Optional[int] = None
+    collaboration_task: Optional[int] = None
+
+    # Flexible score payload mapping
+    scores: Optional[Dict[str, Any]] = None
+
+    # Legacy fields (0-25) for backwards compatibility
+    innovation: Optional[int] = None
+    execution: Optional[int] = None
+    impact: Optional[int] = None
+    presentation: Optional[int] = None
 
 class ToggleLeaderboardRequest(BaseModel):
     visible: bool
@@ -2168,31 +2195,103 @@ def submit_jury_score(req: JuryScoreSubmit):
     if req.juror_id not in JURY_CREDENTIALS:
         raise HTTPException(status_code=401, detail='Invalid juror ID.')
 
-    for field_name, val in [
-        ('innovation', req.innovation),
-        ('execution', req.execution),
-        ('impact', req.impact),
-        ('presentation', req.presentation),
-    ]:
-        if not (0 <= val <= 25):
-            raise HTTPException(status_code=400, detail=f'{field_name} must be between 0 and 25.')
-
     round_key = req.review_round.strip().lower() if getattr(req, 'review_round', None) else "review1"
     if round_key not in ("review1", "review2"):
         round_key = "review1"
 
-    total = req.innovation + req.execution + req.impact + req.presentation
-    score_entry = {
-        'innovation':   req.innovation,
-        'execution':    req.execution,
-        'impact':       req.impact,
-        'presentation': req.presentation,
-        'total':        total,
-        'submitted_at': int(time.time()),
-        'juror_id':     req.juror_id,
-        'team_id':      req.team_id,
-        'review_round': round_key,
-    }
+    # Extract score map
+    scores_input = req.scores or {}
+    if not isinstance(scores_input, dict):
+        scores_input = {}
+
+    if round_key == "review1":
+        # Review 1 Evaluation Criteria (0-25 each, total 100):
+        # 1. Problem Identification & Importance
+        # 2. Alignment with Selected SDG Goals
+        # 3. Innovation / Uniqueness of Idea
+        # 4. Feasibility & Practicality of Solution
+        c1 = req.problem_identification if req.problem_identification is not None else scores_input.get('problem_identification', req.innovation if req.innovation is not None else 0)
+        c2 = req.sdg_alignment if req.sdg_alignment is not None else scores_input.get('sdg_alignment', req.impact if req.impact is not None else 0)
+        c3 = req.innovation_uniqueness if req.innovation_uniqueness is not None else scores_input.get('innovation_uniqueness', req.execution if req.execution is not None else 0)
+        c4 = req.feasibility_practicality if req.feasibility_practicality is not None else scores_input.get('feasibility_practicality', req.presentation if req.presentation is not None else 0)
+
+        field_checks = [
+            ('Problem Identification & Importance', c1),
+            ('Alignment with Selected SDG Goals', c2),
+            ('Innovation / Uniqueness of Idea', c3),
+            ('Feasibility & Practicality of Solution', c4),
+        ]
+        for fname, val in field_checks:
+            try:
+                v = int(val)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f'{fname} must be a valid number.')
+            if not (0 <= v <= 25):
+                raise HTTPException(status_code=400, detail=f'{fname} must be between 0 and 25.')
+
+        c1, c2, c3, c4 = int(c1), int(c2), int(c3), int(c4)
+        total = c1 + c2 + c3 + c4
+
+        score_entry = {
+            'problem_identification':   c1,
+            'sdg_alignment':            c2,
+            'innovation_uniqueness':    c3,
+            'feasibility_practicality': c4,
+            # Backward-compatibility aliases
+            'innovation':               c1,
+            'impact':                   c2,
+            'execution':                c3,
+            'presentation':             c4,
+            'total':                    total,
+            'submitted_at':             int(time.time()),
+            'juror_id':                 req.juror_id,
+            'team_id':                  req.team_id,
+            'review_round':             round_key,
+        }
+    else:
+        # Review 2 Evaluation Criteria (0-25 each, total 100):
+        # 1. System Architecture / Design Clarity
+        # 2. Technical Approach & Tools Used
+        # 3. Development Progress During Hackathon
+        # 4. Team Collaboration & Task Distribution
+        c1 = req.system_architecture if req.system_architecture is not None else scores_input.get('system_architecture', req.execution if req.execution is not None else 0)
+        c2 = req.technical_approach if req.technical_approach is not None else scores_input.get('technical_approach', req.innovation if req.innovation is not None else 0)
+        c3 = req.development_progress if req.development_progress is not None else scores_input.get('development_progress', req.impact if req.impact is not None else 0)
+        c4 = req.collaboration_task if req.collaboration_task is not None else scores_input.get('collaboration_task', req.presentation if req.presentation is not None else 0)
+
+        field_checks = [
+            ('System Architecture / Design Clarity', c1),
+            ('Technical Approach & Tools Used', c2),
+            ('Development Progress During Hackathon', c3),
+            ('Team Collaboration & Task Distribution', c4),
+        ]
+        for fname, val in field_checks:
+            try:
+                v = int(val)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f'{fname} must be a valid number.')
+            if not (0 <= v <= 25):
+                raise HTTPException(status_code=400, detail=f'{fname} must be between 0 and 25.')
+
+        c1, c2, c3, c4 = int(c1), int(c2), int(c3), int(c4)
+        total = c1 + c2 + c3 + c4
+
+        score_entry = {
+            'system_architecture':     c1,
+            'technical_approach':      c2,
+            'development_progress':    c3,
+            'collaboration_task':      c4,
+            # Backward-compatibility aliases
+            'execution':               c1,
+            'innovation':              c2,
+            'impact':                  c3,
+            'presentation':            c4,
+            'total':                   total,
+            'submitted_at':            int(time.time()),
+            'juror_id':                req.juror_id,
+            'team_id':                 req.team_id,
+            'review_round':            round_key,
+        }
 
     try:
         # Fetch current SYSTEM_SETTINGS to retrieve TeamReviewScores
@@ -2272,28 +2371,36 @@ def submit_jury_score(req: JuryScoreSubmit):
 
             if round_key == "review1":
                 update_parts.extend([
-                    "Review1_Innovation = :r1_inno",
-                    "Review1_Execution = :r1_exec",
-                    "Review1_Impact = :r1_imp",
-                    "Review1_Presentation = :r1_pres",
+                    "Review1_ProblemIdentification = :r1_c1",
+                    "Review1_SdgAlignment = :r1_c2",
+                    "Review1_InnovationUniqueness = :r1_c3",
+                    "Review1_FeasibilityPracticality = :r1_c4",
+                    "Review1_Innovation = :r1_c1",
+                    "Review1_Impact = :r1_c2",
+                    "Review1_Execution = :r1_c3",
+                    "Review1_Presentation = :r1_c4",
                     "Review1_Total = :r1_tot"
                 ])
-                expr_vals[':r1_inno'] = req.innovation
-                expr_vals[':r1_exec'] = req.execution
-                expr_vals[':r1_imp'] = req.impact
-                expr_vals[':r1_pres'] = req.presentation
+                expr_vals[':r1_c1'] = c1
+                expr_vals[':r1_c2'] = c2
+                expr_vals[':r1_c3'] = c3
+                expr_vals[':r1_c4'] = c4
             elif round_key == "review2":
                 update_parts.extend([
-                    "Review2_Innovation = :r2_inno",
-                    "Review2_Execution = :r2_exec",
-                    "Review2_Impact = :r2_imp",
-                    "Review2_Presentation = :r2_pres",
+                    "Review2_SystemArchitecture = :r2_c1",
+                    "Review2_TechnicalApproach = :r2_c2",
+                    "Review2_DevelopmentProgress = :r2_c3",
+                    "Review2_CollaborationTask = :r2_c4",
+                    "Review2_Execution = :r2_c1",
+                    "Review2_Innovation = :r2_c2",
+                    "Review2_Impact = :r2_c3",
+                    "Review2_Presentation = :r2_c4",
                     "Review2_Total = :r2_tot"
                 ])
-                expr_vals[':r2_inno'] = req.innovation
-                expr_vals[':r2_exec'] = req.execution
-                expr_vals[':r2_imp'] = req.impact
-                expr_vals[':r2_pres'] = req.presentation
+                expr_vals[':r2_c1'] = c1
+                expr_vals[':r2_c2'] = c2
+                expr_vals[':r2_c3'] = c3
+                expr_vals[':r2_c4'] = c4
 
             table.update_item(
                 Key={'TeamID': req.team_id},
